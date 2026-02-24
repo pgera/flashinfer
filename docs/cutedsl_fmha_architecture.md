@@ -635,6 +635,122 @@ Each step is independently valuable and testable against the existing monolithic
 
 ---
 
+## 9. Implementation Status
+
+This section tracks the current state of the modularization effort. The original monoliths (`prefill.py` at 2933 lines, `mla.py` at 3641 lines) remain untouched. A parallel modular implementation lives in `flashinfer/cute_dsl/attention/` (35 files, ~8140 lines total) and is verified by dedicated test suites.
+
+### Current File Layout
+
+```
+flashinfer/cute_dsl/attention/          # 8140 lines total across 35 files
+│
+│  ── Kernels (top-level, readable dispatchers) ──
+├── prefill.py              (1230 lines)  FMHA prefill kernel
+├── mla_decode.py           (1554 lines)  MLA decode kernel + reduction kernel
+│
+│  ── Configuration ──
+├── config.py               (134 lines)   AttentionConfig, AttentionFusion, HeadMapping
+├── mla_config.py            (74 lines)   MLAConfig (separate concrete type)
+├── tmem_layout.py           (49 lines)   TmemLayout: computed TMEM offsets
+├── warp_schedule.py         (90 lines)   WarpSchedule for FMHA
+├── mla_warp_schedule.py     (79 lines)   MLAWarpSchedule (separate concrete type)
+├── mainloop_spec.py        (173 lines)   MainloopSpec (FMHA) + MLAMainloopSpec
+├── pipeline_topology.py    (315 lines)   PipelineTopology, PipelineEdge, PipelineType, factory
+│
+│  ── FMHA Roles ──
+├── roles/
+│   ├── softmax.py          (501 lines)   SoftmaxRole: online softmax with masking
+│   ├── correction.py       (458 lines)   CorrectionRole: rescale + epilog
+│   ├── mma.py              (258 lines)   MmaRole: QK + PV GEMMs
+│   ├── loader_tma.py       (316 lines)   LoaderRole: TMA loads for Q, K, V
+│   ├── epilogue.py         (163 lines)   EpilogueRole: TMA store output
+│
+│  ── MLA Roles ──
+│   ├── mla_loader.py       (312 lines)   MLALoaderRole: paged latent + RoPE loads
+│   ├── mla_mma.py          (266 lines)   MLAMmaRole: QK + PV with head packing
+│   ├── mla_compute.py      (106 lines)   MLAComputeRole: orchestrator
+│   ├── mla_softmax.py      (234 lines)   MLASoftmaxRole: online softmax
+│   ├── mla_rescale.py       (75 lines)   MLARescaleRole: O accumulator rescaling
+│   ├── mla_epilogue.py     (153 lines)   MLAEpilogueRole: final output write
+│
+│  ── Shared Utilities ──
+│   ├── softmax_math.py      (40 lines)   exp2_scale, packed_row_sum
+│   ├── tmem_utils.py       (101 lines)   tmem_load_partition
+│
+│  ── Fusion / Masking ──
+├── fusion/
+│   ├── mask.py             (160 lines)   MaskType, apply_mask, trip count helpers
+│   ├── logits_transform.py               sigmoid_logits_transform
+│   ├── output_transform.py               dumb_output_transform
+│   └── softmax_modifier.py               (stub)
+│
+│  ── Schedulers ──
+├── scheduler/
+│   ├── persistent.py       (166 lines)   FmhaStaticTileScheduler
+│   └── mla_persistent.py   (200 lines)   MLAStaticTileScheduler
+│
+│  ── PyTorch Wrappers ──
+└── wrappers/
+    ├── batch_prefill.py    (381 lines)   BatchPrefillCuteDSLWrapper
+    └── batch_mla.py        (428 lines)   BatchMLAPagedAttentionWrapperCuteDSL
+```
+
+### Shared vs Variant-Specific Components
+
+| Component | Shared | FMHA-specific | MLA-specific |
+|-----------|--------|---------------|--------------|
+| **Pipeline infrastructure** | `PipelineTopology`, `PipelineEdge`, `PipelineType`, `create_pipelines()` | `make_fmha_topology()` | `make_mla_topology()`, `ASYNC_UMMA` type |
+| **Mainloop spec** | Dataclass pattern, stage count resolution | `MainloopSpec` | `MLAMainloopSpec` |
+| **Warp schedule** | Concept (dataclass with role IDs, register budgets) | `WarpSchedule` (16 warps) | `MLAWarpSchedule` (6-8 warps) |
+| **Softmax math** | `exp2_scale()`, `packed_row_sum()` | Used by `SoftmaxRole` | Used by `MLASoftmaxRole` |
+| **TMEM utilities** | `tmem_load_partition()` | — | Used by `MLARescaleRole`, `MLAEpilogueRole` |
+| **Masking** | `MaskType`, `apply_mask()`, trip count helpers | Used inline in `SoftmaxRole` | Boundary masking inline in `MLASoftmaxRole` |
+| **Loader** | — | `LoaderRole` (streaming Q/K/V) | `MLALoaderRole` (paged latent + RoPE) |
+| **MMA** | — | `MmaRole` (double-buffered QK/PV) | `MLAMmaRole` (staged, head-packed) |
+| **Correction / Rescale** | Packed-scale pattern (similar but not yet extracted) | `CorrectionRole` | `MLARescaleRole` |
+| **Epilogue** | — | `EpilogueRole` (TMA store) | `MLAEpilogueRole` (direct write) |
+| **Scheduler** | — | `FmhaStaticTileScheduler` | `MLAStaticTileScheduler` |
+| **Fusion hooks** | `AttentionFusion` (logits/output transforms, sinks) | Full support | Not yet wired |
+
+### Comparison to C++ CUTLASS Collectives
+
+| Aspect | C++ CUTLASS | Current Python Implementation |
+|--------|-------------|-------------------------------|
+| **Kernel template** | One shared kernel (`Sm100FmhaFwdKernelTmaWarpspecialized`) parameterized by mainloop type | Separate kernel files (`prefill.py`, `mla_decode.py`) — both are thin dispatchers |
+| **Mainloop** | `Sm100FmhaFwd*` / `Sm100FmhaMlaFwd*` concrete types defining pipelines + TMEM + roles | `MainloopSpec` / `MLAMainloopSpec` dataclasses with `PipelineTopology` + `TmemLayout` |
+| **Pipeline creation** | Types defined in mainloop, instantiated by kernel | Declarative `PipelineTopology` with `create_pipelines()` factory |
+| **Roles** | Methods on the mainloop (`load()`, `mma()`, `softmax()`, `correction()`) | Separate role classes composed by the kernel |
+| **Shared math** | Inline in each mainloop (no cross-variant sharing) | Extracted: `softmax_math.py`, `tmem_utils.py` |
+| **Config** | Template parameters + `Params` struct | `AttentionConfig` / `MLAConfig` dataclasses |
+| **CollectiveBuilder** | Selects MMA atoms, TMA descriptors, pipeline types from config | Not yet implemented |
+
+The Python implementation actually shares *more* code across variants than C++ CUTLASS, which keeps each mainloop self-contained. The tradeoff is that C++ gets maximum compile-time optimization per variant while Python uses JIT compilation that naturally specializes per call.
+
+### Test Status
+
+| Test Suite | Total | Pass | Fail | Notes |
+|------------|-------|------|------|-------|
+| `test_blackwell_fmha_attention.py` | 252 | 252 | 0 | Full coverage: causal, sliding window, GQA, sinks |
+| `test_blackwell_mla_attention.py` | 24 | 14 | 10 | Failures are pre-existing upstream bugs (same in original `mla.py`) |
+
+### Remaining Work
+
+Listed roughly in order of impact:
+
+1. **Extract `packed_scale` utility** — The `mul_packed_f32x2` loop pattern appears in both `CorrectionRole.rescale()` and `MLARescaleRole.run()`. ~5 lines each. Low risk.
+
+2. **Move role instantiation into MainloopSpec** — Currently the kernel `__init__` creates role instances. Moving this into the mainloop spec would make it closer to the C++ pattern where the mainloop *is* the collective. Medium risk.
+
+3. **Add a CollectiveBuilder** — A factory that selects MMA atoms, TMA descriptors, and pipeline types based on config. Would further reduce kernel boilerplate. Medium risk.
+
+4. **Wire `AttentionFusion` into MLA** — The fusion hooks (logits transforms, output transforms, attention sinks) currently only work in FMHA. Extending to MLA would enable customizable MLA decode. Low-medium risk.
+
+5. **Performance optimizations** — Skip-correction (`vote_all_sync` to avoid rescaling when unnecessary), softmax software pipelining, exp2 emulation, fused atomic reduction for split-KV. These are independent and can be added per-variant.
+
+6. **Unify kernel dispatcher** — The C++ code uses one kernel template for both FMHA and MLA. Currently we have two separate kernel files. Unifying would require abstracting the warp dispatch, which is the most variant-specific part. High risk, potentially not worth it given Python's JIT advantage.
+
+---
+
 ## Appendix: File Reference
 
 ### FlashInfer PR #1549
