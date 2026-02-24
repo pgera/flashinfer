@@ -22,6 +22,7 @@ from cutlass.cute.typing import Int32, Float32
 
 from ...patch import pipeline as pipeline_patch
 
+from .softmax_math import exp2_scale, packed_row_sum
 from ..config import AttentionConfig, AttentionFusion
 from ..tmem_layout import TmemLayout
 from ..fusion.mask import (
@@ -199,7 +200,6 @@ class SoftmaxRole:
         )
 
         scale = scale_softmax_log2
-        minus_row_max_scale = (0.0 - row_max_safe) * scale
 
         # Sequence barrier wait
         if cutlass.const_expr(stage == 0):
@@ -216,18 +216,7 @@ class SoftmaxRole:
         ### the softmax computation part ### e^(xi*scale - mi*scale)
         if cutlass.const_expr(not self.custom_logits_transform):
             for j in range(frg_cnt):
-                for k in range(0, cute.size(tTMEM_LOADrS_frg, mode=[0]), 2):
-                    tTMEM_LOADrS_frg[k, j], tTMEM_LOADrS_frg[k + 1, j] = (
-                        cute.arch.fma_packed_f32x2(
-                            (tTMEM_LOADrS_frg[k, j], tTMEM_LOADrS_frg[k + 1, j]),
-                            (scale, scale),
-                            (minus_row_max_scale, minus_row_max_scale),
-                        )
-                    )
-                    tTMEM_LOADrS_frg[k, j] = cute.arch.exp2(tTMEM_LOADrS_frg[k, j])
-                    tTMEM_LOADrS_frg[k + 1, j] = cute.arch.exp2(
-                        tTMEM_LOADrS_frg[k + 1, j]
-                    )
+                exp2_scale(tTMEM_LOADrS_frg[None, j], scale, row_max_safe)
                 s_vec = tTMEM_LOADrS_frg[None, j].load()
                 tTMEM_STORErS_x4_e_frg[None, j].store(s_vec.to(self.q_dtype))
 
@@ -260,35 +249,10 @@ class SoftmaxRole:
         ### di = di-1 * (e^(mi-1 - mi) * scale) + sum e^(xi*scale - mi*scale)
         vec_i_handle = si_corr_producer.acquire_and_advance()
         acc_scale_ = scale * (old_row_max - row_max_safe)
-        acc_scale = cute.arch.exp2(acc_scale_) * 0.5
+        acc_scale = cute.arch.exp2(acc_scale_)
         row_sum *= acc_scale
-        local_row_sum_0 = (row_sum, row_sum)
-        local_row_sum_1 = (0.0, 0.0)
-        local_row_sum_2 = (0.0, 0.0)
-        local_row_sum_3 = (0.0, 0.0)
-
-        reduction_unroll = 4
-        frg_tile = cute.size(tTMEM_LOADrS) // reduction_unroll
-        tTMEM_LOADrS_frg = cute.logical_divide(tTMEM_LOADrS, cute.make_layout(frg_tile))
-
-        for j in cutlass.range_constexpr(0, cute.size(tTMEM_LOADrS_frg, mode=[0]), 2):
-            local_row_sum_0 = cute.arch.add_packed_f32x2(
-                local_row_sum_0, (tTMEM_LOADrS_frg[j, 0], tTMEM_LOADrS_frg[j + 1, 0])
-            )
-            local_row_sum_1 = cute.arch.add_packed_f32x2(
-                local_row_sum_1, (tTMEM_LOADrS_frg[j, 1], tTMEM_LOADrS_frg[j + 1, 1])
-            )
-            local_row_sum_2 = cute.arch.add_packed_f32x2(
-                local_row_sum_2, (tTMEM_LOADrS_frg[j, 2], tTMEM_LOADrS_frg[j + 1, 2])
-            )
-            local_row_sum_3 = cute.arch.add_packed_f32x2(
-                local_row_sum_3, (tTMEM_LOADrS_frg[j, 3], tTMEM_LOADrS_frg[j + 1, 3])
-            )
-
-        local_row_sum_0 = cute.arch.add_packed_f32x2(local_row_sum_0, local_row_sum_1)
-        local_row_sum_2 = cute.arch.add_packed_f32x2(local_row_sum_2, local_row_sum_3)
-        local_row_sum_0 = cute.arch.add_packed_f32x2(local_row_sum_0, local_row_sum_2)
-        row_sum = local_row_sum_0[0] + local_row_sum_0[1]
+        row_sum_vec = packed_row_sum(tTMEM_LOADrS)
+        row_sum = row_sum_vec[0] + row_sum_vec[1] + row_sum
 
         return (
             row_max,

@@ -14,6 +14,8 @@ import cutlass.cute as cute
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.pipeline as pipeline
 
+from .softmax_math import exp2_scale, packed_row_sum
+
 
 class MLASoftmaxRole:
     def __init__(self, config, mainloop, schedule, exchange_sync_bar):
@@ -171,17 +173,7 @@ class MLASoftmaxRole:
             (row_max - row_max_new) * softmax_params.softmax_scale_log2
         )
         row_max = row_max_new
-        fma_b = (softmax_params.softmax_scale_log2, softmax_params.softmax_scale_log2)
-        fma_c = (
-            (0.0 - row_max_new) * softmax_params.softmax_scale_log2,
-            (0.0 - row_max_new) * softmax_params.softmax_scale_log2,
-        )
-        for i in cutlass.range_constexpr(0, cute.size(tTR_rAcc), 2):
-            tTR_rAcc[i], tTR_rAcc[i + 1] = cute.arch.fma_packed_f32x2(
-                (tTR_rAcc[i], tTR_rAcc[i + 1]), fma_b, fma_c
-            )
-            tTR_rAcc[i] = cute.arch.exp2(tTR_rAcc[i])
-            tTR_rAcc[i + 1] = cute.arch.exp2(tTR_rAcc[i + 1])
+        exp2_scale(tTR_rAcc, softmax_params.softmax_scale_log2, row_max_new)
 
         tTR_rS = cute.make_fragment_like(tTR_tS, self.q_dtype)
 
@@ -222,11 +214,7 @@ class MLASoftmaxRole:
         cute.copy(smem_tiled_copy, rP_copy_view, sP_copy_view)
 
         row_sum = row_sum * correction_factor
-        row_sum_vec = (0.0, 0.0)
-        for i in cutlass.range_constexpr(0, cute.size(tTR_rAcc), 2):
-            row_sum_vec = cute.arch.add_packed_f32x2(
-                row_sum_vec, (tTR_rAcc[i], tTR_rAcc[i + 1])
-            )
+        row_sum_vec = packed_row_sum(tTR_rAcc)
         row_sum = row_sum_vec[0] + row_sum_vec[1] + row_sum
 
         cute.arch.fence_view_async_tmem_load()
