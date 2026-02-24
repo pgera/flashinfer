@@ -46,6 +46,11 @@ class MmaRole:
 
     # =========================================================================
     #  Reusable primitives — no pipeline awareness, for composing new kernels
+    #
+    #  All primitives below are SAFE to call from run() and other @cute.jit
+    #  methods. They are void (no return values) and only use compile-time
+    #  indexing (unrolled kphase loops), avoiding the CuTe DSL JIT
+    #  limitations with runtime tensor views and return values.
     # =========================================================================
 
     @cute.jit
@@ -111,7 +116,7 @@ class MmaRole:
         cute.arch.dealloc_tmem(tmem_ptr, tmem_alloc_cols)
 
     # =========================================================================
-    #  Prefill orchestration — proven-correct inline implementation
+    #  Prefill orchestration — uses primitives for GEMMs and TMEM lifecycle
     # =========================================================================
 
     @cute.jit
@@ -145,12 +150,7 @@ class MmaRole:
         Double-buffered interleaved QK/PV GEMMs with pipeline synchronization.
         """
         # Alloc tmem buffer
-        tmem_alloc_cols = Int32(self.tmem_alloc_cols)
-        cute.arch.alloc_tmem(tmem_alloc_cols, storage.tmem_holding_buf)
-        cute.arch.barrier(
-            barrier_id=self.tmem_alloc_sync_bar_id,
-            number_of_threads=self.threads_per_warp,
-        )
+        self.alloc_tmem(storage)
         tile_sched = create_fmha_static_tile_scheduler(
             tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
         )
@@ -183,28 +183,14 @@ class MmaRole:
                 k_handle_consumer = load_kv_consumer.wait_and_advance()
                 tSrK0 = tSrK[None, None, None, k_handle_consumer.index]
                 s0_handle_producer = mma_s0_producer.acquire_and_advance()
-                num_kphases = cute.size(tSrQ0, mode=[2])
-                for kphase_idx in cutlass.range(num_kphases, unroll_full=True):
-                    kphase_coord_0 = (None, None, kphase_idx)
-                    qk_tiled_mma.set(tcgen05.Field.ACCUMULATE, kphase_idx != 0)
-                    cute.gemm(
-                        qk_tiled_mma, tStS0,
-                        tSrQ0[kphase_coord_0], tSrK0[kphase_coord_0], tStS0,
-                    )
+                self.gemm_qk(qk_tiled_mma, tStS0, tSrQ0, tSrK0)
                 s0_handle_producer.commit()
 
                 # GEMM_QK10 (Q1 * K0 -> S1)
                 q1_handle_consumer = load_q_consumer.wait_and_advance()
                 tSrQ1 = tSrQ[None, None, None, q1_handle_consumer.index]
                 s1_handle_producer = mma_s1_producer.acquire_and_advance()
-                num_kphases = cute.size(tSrQ1, mode=[2])
-                for kphase_idx in cutlass.range(num_kphases, unroll_full=True):
-                    kphase_coord_1 = (None, None, kphase_idx)
-                    qk_tiled_mma.set(tcgen05.Field.ACCUMULATE, kphase_idx != 0)
-                    cute.gemm(
-                        qk_tiled_mma, tStS1,
-                        tSrQ1[kphase_coord_1], tSrK0[kphase_coord_1], tStS1,
-                    )
+                self.gemm_qk(qk_tiled_mma, tStS1, tSrQ1, tSrK0)
                 s1_handle_producer.commit()
                 k_handle_consumer.release()
 
@@ -213,14 +199,7 @@ class MmaRole:
                 tOrVi = tOrV[None, None, None, v_handle_consumer.index]
                 o0_handle_producer = mma_corr_producer.acquire_and_advance()
                 s0_handle_producer = mma_s0_producer.acquire_and_advance()
-                num_kphases = cute.size(tOrP0, mode=[2])
-                for kphase_idx in cutlass.range(num_kphases, unroll_full=True):
-                    kphase_coord_2 = (None, None, kphase_idx)
-                    pv_tiled_mma.set(tcgen05.Field.ACCUMULATE, kphase_idx != 0)
-                    cute.gemm(
-                        pv_tiled_mma, tOtO0,
-                        tOrP0[kphase_coord_2], tOrVi[kphase_coord_2], tOtO0,
-                    )
+                self.gemm_pv(pv_tiled_mma, tOtO0, tOrP0, tOrVi, False)
                 o0_handle_producer.commit()
 
                 seqlen_kv_loop_steps = (
@@ -233,46 +212,19 @@ class MmaRole:
                     # GEMM_QK0i
                     k_handle_consumer = load_kv_consumer.wait_and_advance()
                     tSrKi = tSrK[None, None, None, k_handle_consumer.index]
-                    inner_num_kphases = cute.size(tSrQ0, mode=[2])
-                    for kphase_idx in cutlass.range(
-                        inner_num_kphases, unroll_full=True
-                    ):
-                        kphase_coord_3 = (None, None, kphase_idx)
-                        qk_tiled_mma.set(tcgen05.Field.ACCUMULATE, kphase_idx != 0)
-                        cute.gemm(
-                            qk_tiled_mma, tStS0,
-                            tSrQ0[kphase_coord_3], tSrKi[kphase_coord_3], tStS0,
-                        )
+                    self.gemm_qk(qk_tiled_mma, tStS0, tSrQ0, tSrKi)
                     s0_handle_producer.commit()
 
                     # GEMM_PV1(i-1)
                     o1_handle_producer = mma_corr_producer.acquire_and_advance()
                     s1_handle_producer = mma_s1_producer.acquire_and_advance()
-                    inner_num_kphases = cute.size(tOrP0, mode=[2])
-                    for kphase_idx in cutlass.range(
-                        inner_num_kphases, unroll_full=True
-                    ):
-                        kphase_coord_4 = (None, None, kphase_idx)
-                        pv_tiled_mma.set(tcgen05.Field.ACCUMULATE, pv_whether_acc)
-                        cute.gemm(
-                            pv_tiled_mma, tOtO1,
-                            tOrP1[kphase_coord_4], tOrVi[kphase_coord_4], tOtO1,
-                        )
-                        pv_whether_acc = True
+                    self.gemm_pv(pv_tiled_mma, tOtO1, tOrP1, tOrVi, pv_whether_acc)
+                    pv_whether_acc = True
                     o1_handle_producer.commit()
                     v_handle_consumer.release()
 
                     # GEMM_QK1i
-                    inner_num_kphases = cute.size(tSrQ1, mode=[2])
-                    for kphase_idx in cutlass.range(
-                        inner_num_kphases, unroll_full=True
-                    ):
-                        kphase_coord_5 = (None, None, kphase_idx)
-                        qk_tiled_mma.set(tcgen05.Field.ACCUMULATE, kphase_idx != 0)
-                        cute.gemm(
-                            qk_tiled_mma, tStS1,
-                            tSrQ1[kphase_coord_5], tSrKi[kphase_coord_5], tStS1,
-                        )
+                    self.gemm_qk(qk_tiled_mma, tStS1, tSrQ1, tSrKi)
                     s1_handle_producer.commit()
                     k_handle_consumer.release()
 
@@ -281,16 +233,7 @@ class MmaRole:
                     tOrVi = tOrV[None, None, None, v_handle_consumer.index]
                     o0_handle_producer = mma_corr_producer.acquire_and_advance()
                     s0_handle_producer = mma_s0_producer.acquire_and_advance()
-                    inner_num_kphases = cute.size(tOrP0, mode=[2])
-                    for kphase_idx in cutlass.range(
-                        inner_num_kphases, unroll_full=True
-                    ):
-                        kphase_coord_6 = (None, None, kphase_idx)
-                        pv_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
-                        cute.gemm(
-                            pv_tiled_mma, tOtO0,
-                            tOrP0[kphase_coord_6], tOrVi[kphase_coord_6], tOtO0,
-                        )
+                    self.gemm_pv(pv_tiled_mma, tOtO0, tOrP0, tOrVi, True)
                     o0_handle_producer.commit()
 
                 # release Q0 & Q1
@@ -300,14 +243,7 @@ class MmaRole:
                 # GEMM_PV1(end)
                 o1_handle = mma_corr_producer.acquire_and_advance()
                 s1_handle_producer = mma_s1_producer.acquire_and_advance()
-                num_kphases = cute.size(tOrP1, mode=[2])
-                for kphase_idx in cutlass.range(num_kphases, unroll_full=True):
-                    kphase_coord_7 = (None, None, kphase_idx)
-                    pv_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
-                    cute.gemm(
-                        pv_tiled_mma, tOtO1,
-                        tOrP1[kphase_coord_7], tOrVi[kphase_coord_7], tOtO1,
-                    )
+                self.gemm_pv(pv_tiled_mma, tOtO1, tOrP1, tOrVi, True)
                 o1_handle.commit()
                 v_handle_consumer.release()
 
@@ -319,12 +255,4 @@ class MmaRole:
             work_tile = tile_sched.get_current_work()
 
         # dealloc tmem buffer
-        cute.arch.relinquish_tmem_alloc_permit()
-        cute.arch.mbarrier_wait(tmem_dealloc_mbar_ptr, 0)
-        tmem_alloc_cols = Int32(self.tmem_alloc_cols)
-        tmem_ptr = cute.arch.retrieve_tmem_ptr(
-            Float32,
-            alignment=16,
-            ptr_to_buffer_holding_addr=storage.tmem_holding_buf,
-        )
-        cute.arch.dealloc_tmem(tmem_ptr, tmem_alloc_cols)
+        self.dealloc_tmem(storage, tmem_dealloc_mbar_ptr)

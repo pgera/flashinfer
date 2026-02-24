@@ -44,10 +44,14 @@ class LoaderRole:
     # =========================================================================
     #  Reusable primitives — for composing new kernel variants
     #
-    #  NOTE: These primitives return tensors/handles from @cute.jit methods.
-    #  CuTe DSL may not support this in all contexts. Use directly in kernel
-    #  code where JIT return-value support is confirmed, or use the inline
-    #  patterns in run() as a reference.
+    #  NOTE on CuTe DSL JIT limitations:
+    #  - partition_q/k/v(): Return tensor tuples — CuTe DSL JIT does not
+    #    reliably handle returning tensors from @cute.jit methods.
+    #  - load_tile(): Uses runtime indexing (handle.index) to create tensor
+    #    views internally — causes correctness issues in CuTe DSL JIT.
+    #  These primitives document the intended decomposition but cannot be
+    #  used inside run() until CuTe DSL JIT support improves. Use the
+    #  inline patterns in run() as the working reference.
     # =========================================================================
 
     @cute.jit
@@ -259,7 +263,6 @@ class LoaderRole:
                     self.mask_type, self.window_left,
                     curr_block_coord, self.cta_tiler, seqlen_k
                 )
-
                 k_handle_producer = load_kv_producer.acquire_and_advance()
                 cute.copy(
                     tma_atom_k,

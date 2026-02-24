@@ -1255,7 +1255,7 @@ class BlackwellMultiLatentAttentionForward:
             sum_lse = cute.arch.warp_reduction_sum(sum_lse)
             # calculate the global_lse
             global_lse = (
-                lse_max + cute.arch.log2(sum_lse)
+                lse_max + cute.math.log2(sum_lse)
                 if sum_lse != self.lse_dtype(0.0) or sum_lse != sum_lse
                 else self.lse_dtype.inf
             )
@@ -2663,7 +2663,7 @@ class BlackwellMultiLatentAttentionForward:
                     ),
                     (1, None, 1),
                 )
-            lse = cute.arch.log2(row_sum) + epilogue_params.softmax_scale_log2 * row_max
+            lse = cute.math.log2(row_sum) + epilogue_params.softmax_scale_log2 * row_max
             if cutlass.const_expr(self.warps_in_n == 2):
                 if cute.elem_less(cLSE[common_params.tidx][0], self.num_heads):
                     gLSE[common_params.tidx] = lse

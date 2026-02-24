@@ -38,10 +38,11 @@ class EpilogueRole:
     # =========================================================================
     #  Reusable primitives — for composing new kernel variants
     #
-    #  NOTE: These primitives return tensors from @cute.jit methods.
-    #  CuTe DSL may not support this in all contexts. Use directly in kernel
-    #  code where JIT return-value support is confirmed, or use the inline
-    #  patterns in run() as a reference.
+    #  NOTE on CuTe DSL JIT limitations:
+    #  - partition_output(): Returns tensor tuples — CuTe DSL JIT does not
+    #    reliably handle returning tensors from @cute.jit methods.
+    #  - store_tile(): SAFE — takes pre-sliced tensors as arguments, no
+    #    runtime indexing or return values. Used in run() successfully.
     # =========================================================================
 
     @cute.jit
@@ -145,13 +146,11 @@ class EpilogueRole:
 
                 # O0: wait from correction, store to GMEM
                 o0_handle_consumer = corr_epi_consumer.wait_and_advance()
-                cute.copy(tma_atom_o, tOsO[None, 0], tOgO[None, o0_coord])
-                cute.arch.cp_async_bulk_commit_group()
+                self.store_tile(tma_atom_o, tOsO[None, 0], tOgO[None, o0_coord])
 
                 # O1: wait from correction, store to GMEM
                 o1_handle_consumer = corr_epi_consumer.wait_and_advance()
-                cute.copy(tma_atom_o, tOsO[None, 1], tOgO[None, o1_coord])
-                cute.arch.cp_async_bulk_commit_group()
+                self.store_tile(tma_atom_o, tOsO[None, 1], tOgO[None, o1_coord])
 
                 # Wait for stores to complete before releasing pipeline
                 cute.arch.cp_async_bulk_wait_group(1, read=True)

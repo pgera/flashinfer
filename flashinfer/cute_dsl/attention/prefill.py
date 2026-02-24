@@ -36,16 +36,16 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.utils as utils
-import cutlass.pipeline as pipeline
 import cutlass.torch as cutlass_torch
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.typing import Int32, Int64, Float32, Boolean
 
-from ..patch import pipeline as pipeline_patch
-
 from .config import AttentionConfig, AttentionFusion
 from .tmem_layout import TmemLayout
+from .warp_schedule import WarpSchedule, PREFILL_SCHEDULE
+from .pipeline_topology import PipelineTopology, make_prefill_topology
+from .mainloop_spec import MainloopSpec, make_prefill_mainloop_spec
 from .fusion.mask import (
     MaskType,
     apply_mask,
@@ -133,6 +133,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         self,
         config: AttentionConfig,
         fusion: AttentionFusion | None = None,
+        warp_schedule: WarpSchedule | None = None,
     ):
         """Initializes a Blackwell Fused Multi-Head Attention (FMHA) kernel.
 
@@ -144,12 +145,16 @@ class BlackwellFusedMultiHeadAttentionForward:
         :type config: AttentionConfig
         :param fusion: Optional customization callbacks (logits/output transforms, sinks).
         :type fusion: AttentionFusion | None
+        :param warp_schedule: Warp role assignment and register budgets. Defaults to PREFILL_SCHEDULE.
+        :type warp_schedule: WarpSchedule | None
         """
 
         # Store structured config objects
         self.config = config
         self.fusion = fusion if fusion is not None else AttentionFusion()
-        self.tmem = TmemLayout.from_config(config)
+        self.schedule = warp_schedule if warp_schedule is not None else PREFILL_SCHEDULE
+        self.mainloop = make_prefill_mainloop_spec(config, self.schedule)
+        self.tmem = self.mainloop.tmem_layout
 
         # Unpack config onto self for backward compat with kernel body code
         self.qk_acc_dtype = config.qk_acc_dtype
@@ -163,31 +168,21 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.num_repeat_kv_heads = config.num_repeat_kv_heads
         self.window_left = config.window_left
 
-        # Warp assignment (future: extract to roles/)
-        self.softmax0_warp_ids = (0, 1, 2, 3)
-        self.softmax1_warp_ids = (4, 5, 6, 7)
-        self.correction_warp_ids = (8, 9, 10, 11)
-        self.mma_warp_id = 12
-        self.load_warp_id = 13
-        self.epilogue_warp_id = 14
-        self.empty_warp_id = 15
+        # Unpack warp schedule onto self for backward compat with kernel body code
+        sched = self.schedule
+        self.softmax0_warp_ids = sched.softmax0_warp_ids
+        self.softmax1_warp_ids = sched.softmax1_warp_ids
+        self.correction_warp_ids = sched.correction_warp_ids
+        self.mma_warp_id = sched.mma_warp_id
+        self.load_warp_id = sched.load_warp_id
+        self.epilogue_warp_id = sched.epilogue_warp_id
+        self.empty_warp_id = sched.empty_warp_id
         self.tmem_alloc_cols = self.tmem.alloc_cols
 
-        self.threads_per_warp = 32
-        self.threads_per_cta = self.threads_per_warp * len(
-            (
-                *self.softmax0_warp_ids,
-                *self.softmax1_warp_ids,
-                *self.correction_warp_ids,
-                self.mma_warp_id,
-                self.load_warp_id,
-                self.epilogue_warp_id,
-                self.empty_warp_id,
-            )
-        )
-
-        self.cta_sync_bar_id = 0
-        self.tmem_alloc_sync_bar_id = 1
+        self.threads_per_warp = sched.threads_per_warp
+        self.threads_per_cta = sched.threads_per_cta
+        self.cta_sync_bar_id = sched.cta_sync_bar_id
+        self.tmem_alloc_sync_bar_id = sched.tmem_alloc_sync_bar_id
 
         # Unpack TMEM layout onto self
         self.tmem_s0_offset = self.tmem.s0_offset
@@ -199,18 +194,13 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.tmem_vec0_offset = self.tmem.vec0_offset
         self.tmem_vec1_offset = self.tmem.vec1_offset
 
-        self.num_regs_softmax = 192
-        self.num_regs_correction = 96
-        self.num_regs_other = 32
-        self.num_regs_empty = 24
+        self.num_regs_softmax = sched.num_regs_softmax
+        self.num_regs_correction = sched.num_regs_correction
+        self.num_regs_other = sched.num_regs_other
+        self.num_regs_empty = sched.num_regs_empty
 
         self.buffer_align_bytes = 1024
-
-        num_warps_per_warpgroup = 4
-        self.softmax_warpgroup_count = (
-            len((*self.softmax0_warp_ids, *self.softmax1_warp_ids))
-            // num_warps_per_warpgroup
-        )
+        self.softmax_warpgroup_count = sched.softmax_warpgroup_count
 
         # Unpack fusion onto self
         self.custom_logits_transform = self.fusion.logits_transform is not None
@@ -246,20 +236,19 @@ class BlackwellFusedMultiHeadAttentionForward:
     def _setup_attributes(self):
         """Set up configurations and parameters for the FMHA kernel operation.
 
-        This method initializes and configures various attributes required for the
-        execution of the fused multi-head attention kernel, mainly about the pipeline stages:
-
-        - Sets up staging parameters for Q, K, V inputs and accumulator data
-        - Configures pipeline stages for softmax, correction, and epilogue operations
+        Resolves dtype-dependent stage counts via MainloopSpec, then unpacks
+        stage counts onto self for backward compat with SharedStorage and kernel code.
         """
 
-        self.q_stage = 2
-        self.kv_stage = 4 if self.q_dtype.width == 8 else 3
-        self.acc_stage = 1
-        self.softmax_corr_stage = 1
-        self.mma_corr_stage = 2
-        self.mma_softmax_stage = 1
-        self.epi_stage = 2
+        self.mainloop.resolve(self.q_dtype.width)
+
+        self.q_stage = self.mainloop.q_stages
+        self.kv_stage = self.mainloop.kv_stages
+        self.acc_stage = self.mainloop.acc_stage
+        self.softmax_corr_stage = self.mainloop.softmax_corr_stage
+        self.mma_corr_stage = self.mainloop.mma_corr_stage
+        self.mma_softmax_stage = self.mainloop.mma_softmax_stage
+        self.epi_stage = self.mainloop.epi_stage
 
     @cute.jit
     def __call__(
@@ -672,96 +661,31 @@ class BlackwellFusedMultiHeadAttentionForward:
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
-        load_q_producer, load_q_consumer = pipeline_patch.make_pipeline_participants(
-            pipeline_type=pipeline.PipelineTmaUmma,
-            barrier_storage=storage.load_q_mbar_ptr.data_ptr(),
-            num_stages=self.q_stage,
-            producer_thread_count=len([self.load_warp_id]),
-            consumer_thread_count=len([self.mma_warp_id]),
-            tx_count=self.tma_copy_q_bytes,
+        # Create all pipelines from topology
+        barrier_ptrs = {
+            edge.name: getattr(storage, edge.barrier_field_name).data_ptr()
+            for edge in self.mainloop.pipeline_topology.edges
+        }
+        tx_counts = {"q": self.tma_copy_q_bytes, "kv": self.tma_copy_kv_bytes}
+        pipes = self.mainloop.pipeline_topology.create_pipelines(
+            barrier_ptrs, tx_counts, self.threads_per_warp,
         )
-        load_kv_producer, load_kv_consumer = pipeline_patch.make_pipeline_participants(
-            pipeline_type=pipeline.PipelineTmaUmma,
-            barrier_storage=storage.load_kv_mbar_ptr.data_ptr(),
-            num_stages=self.kv_stage,
-            producer_thread_count=len([self.load_warp_id]),
-            consumer_thread_count=len([self.mma_warp_id]),
-            tx_count=self.tma_copy_kv_bytes,
-        )
-        mma_s0_producer, mma_s0_consumer = pipeline_patch.make_pipeline_participants(
-            pipeline_type=pipeline.PipelineUmmaAsync,
-            barrier_storage=storage.mma_s0_mbar_ptr.data_ptr(),
-            num_stages=self.mma_softmax_stage,
-            producer_thread_count=len([self.mma_warp_id]),
-            consumer_thread_count=self.threads_per_warp * len(self.softmax0_warp_ids),
-        )
-        mma_s1_producer, mma_s1_consumer = pipeline_patch.make_pipeline_participants(
-            pipeline_type=pipeline.PipelineUmmaAsync,
-            barrier_storage=storage.mma_s1_mbar_ptr.data_ptr(),
-            num_stages=self.mma_softmax_stage,
-            producer_thread_count=len([self.mma_warp_id]),
-            consumer_thread_count=self.threads_per_warp * len(self.softmax1_warp_ids),
-        )
-        s0_corr_producer, s0_corr_consumer = pipeline_patch.make_pipeline_participants(
-            pipeline_type=pipeline.PipelineAsync,
-            barrier_storage=storage.s0_corr_mbar_ptr.data_ptr(),
-            num_stages=self.softmax_corr_stage,
-            producer_thread_count=self.threads_per_warp * len(self.softmax0_warp_ids),
-            consumer_thread_count=self.threads_per_warp * len(self.correction_warp_ids),
-        )
-        s1_corr_producer, s1_corr_consumer = pipeline_patch.make_pipeline_participants(
-            pipeline_type=pipeline.PipelineAsync,
-            barrier_storage=storage.s1_corr_mbar_ptr.data_ptr(),
-            num_stages=self.softmax_corr_stage,
-            producer_thread_count=self.threads_per_warp * len(self.softmax1_warp_ids),
-            consumer_thread_count=self.threads_per_warp * len(self.correction_warp_ids),
-        )
-        corr_epi_producer, corr_epi_consumer = (
-            pipeline_patch.make_pipeline_participants(
-                pipeline_type=pipeline.PipelineAsync,
-                barrier_storage=storage.corr_epi_mbar_ptr.data_ptr(),
-                num_stages=self.epi_stage,
-                producer_thread_count=self.threads_per_warp
-                * len(self.correction_warp_ids),
-                consumer_thread_count=self.threads_per_warp
-                * len([self.epilogue_warp_id]),
-            )
-        )
-        mma_corr_producer, mma_corr_consumer = (
-            pipeline_patch.make_pipeline_participants(
-                pipeline_type=pipeline.PipelineUmmaAsync,
-                barrier_storage=storage.mma_corr_mbar_ptr.data_ptr(),
-                num_stages=self.mma_corr_stage,
-                producer_thread_count=len([self.mma_warp_id]),
-                consumer_thread_count=self.threads_per_warp
-                * len(self.correction_warp_ids),
-            )
-        )
-        s0_s1_sequence_producer, s0_s1_sequence_consumer = (
-            pipeline_patch.make_pipeline_participants(
-                pipeline_type=pipeline.PipelineAsync,
-                barrier_storage=storage.s0_s1_sequence_mbar_ptr.data_ptr(),
-                num_stages=1,
-                producer_thread_count=self.threads_per_warp
-                * len(self.softmax0_warp_ids),
-                consumer_thread_count=self.threads_per_warp
-                * len(self.softmax1_warp_ids),
-            )
-        )
+        load_q_producer, load_q_consumer = pipes["load_q"]
+        load_kv_producer, load_kv_consumer = pipes["load_kv"]
+        mma_s0_producer, mma_s0_consumer = pipes["mma_s0"]
+        mma_s1_producer, mma_s1_consumer = pipes["mma_s1"]
+        s0_corr_producer, s0_corr_consumer = pipes["s0_corr"]
+        s1_corr_producer, s1_corr_consumer = pipes["s1_corr"]
+        corr_epi_producer, corr_epi_consumer = pipes["corr_epi"]
+        mma_corr_producer, mma_corr_consumer = pipes["mma_corr"]
+        s0_s1_sequence_producer, s0_s1_sequence_consumer = pipes["s0_s1_sequence"]
         tmem_dealloc_mbar_ptr = storage.tmem_dealloc_mbar_ptr.data_ptr()
 
         #  Correction & Epilogue & tmem barrier init
         if warp_idx == self.empty_warp_id:
             cute.arch.mbarrier_init(
                 tmem_dealloc_mbar_ptr,
-                self.threads_per_warp
-                * len(
-                    (
-                        *self.softmax0_warp_ids,
-                        *self.softmax1_warp_ids,
-                        *self.correction_warp_ids,
-                    )
-                ),
+                self.schedule.tmem_dealloc_arrive_count,
             )
         cute.arch.mbarrier_init_fence()
 
