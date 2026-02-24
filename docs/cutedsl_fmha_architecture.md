@@ -361,54 +361,77 @@ Prioritized by expected impact:
 
 ---
 
-## 7. Modularization Plan
+## 7. Modularization Design
 
-### Current State
+### Motivation
 
-`prefill.py` (2934 lines) and `mla.py` (3641 lines) are monolithic classes where warp roles, pipeline topology, TMEM layout, softmax algorithm, masking, and scheduling are intertwined. This makes it hard to:
+`prefill.py` (2934 lines) and `mla.py` (3641 lines) were monolithic classes where warp roles, pipeline topology, TMEM layout, softmax algorithm, masking, and scheduling were intertwined. This made it hard to:
 - Add new attention variants without touching the whole kernel
 - Reuse softmax logic between prefill and decode
 - Experiment with pipeline topologies or TMEM layouts
 - Support new architectures without forking
 
-### Target Module Structure
+### Design Principle
+
+**Kernels live at the top level** of the `attention/` package. They are readable, high-level compositions that express the core mathematical algorithm. Building blocks (config, roles, fusion, scheduler, pipeline) live one level below in subdirectories. When you open `attention/prefill.py`, you should see something close to:
+
+> "Load Q, K, V tiles. Compute S = QK^T. Apply mask. Softmax. Compute O = PV. Correct. Write output."
+
+The building blocks handle the *how* (TMEM layout, pipeline synchronization, warp assignment). The kernel expresses the *what*.
+
+Following the C++ CUTLASS collectives pattern, FMHA and MLA use **separate concrete types** (not abstract base classes) for variant-specific components (`AttentionConfig` vs `MLAConfig`, `WarpSchedule` vs `MLAWarpSchedule`), while sharing infrastructure (`PipelineTopology`, `softmax_math`, `tmem_utils`) via composition. The original monolithic files are preserved unchanged; the modular implementation is a parallel codebase in `flashinfer/cute_dsl/attention/`.
+
+### Module Structure
 
 ```
-flashinfer/cute_dsl/
-├── attention/
-│   ├── config.py              # AttentionConfig: problem shape, tiles, dtypes
-│   ├── tmem_layout.py         # TmemLayout: computed TMEM allocation plan
-│   ├── pipeline_topology.py   # PipelineTopology: declarative pipeline graph
-│   │
-│   ├── roles/                 # One module per warp role
-│   │   ├── loader_tma.py      # TMA load warp (Q, K, V)
-│   │   ├── loader_cpasync.py  # cp.async load (for paged decode, future)
-│   │   ├── loader_pt.py       # Page table load warp
-│   │   ├── mma.py             # MMA warp (QK + PV GEMMs)
-│   │   ├── softmax.py         # Softmax warp-group
-│   │   ├── correction.py      # Correction warp-group
-│   │   └── epilogue.py        # Epilogue warp (TMA store)
-│   │
-│   ├── fusion/                # Attention variant customization
-│   │   ├── mask.py            # NoMask, CausalMask, SlidingWindowMask
-│   │   ├── logits_transform.py
-│   │   ├── output_transform.py
-│   │   └── softmax_modifier.py  # Standard, WithSink
-│   │
-│   ├── scheduler/             # Tile scheduling strategies
-│   │   ├── individual.py
-│   │   ├── persistent.py
-│   │   └── causal_persistent.py
-│   │
-│   ├── kernels/               # Composed kernel configurations
-│   │   ├── prefill.py         # Assembles roles for MHA prefill
-│   │   ├── decode.py          # MHA decode
-│   │   ├── mla_decode.py      # MLA decode
-│   │   └── mla_prefill.py     # MLA prefill
-│   │
-│   └── wrappers/              # PyTorch-facing API
-│       ├── batch_prefill.py
-│       └── batch_mla_decode.py
+flashinfer/cute_dsl/attention/
+├── __init__.py                    # Re-exports public API
+│
+│  ── Kernels (top-level: readable dispatchers) ──
+├── prefill.py                     # FMHA prefill kernel
+├── mla_decode.py                  # MLA decode kernel + reduction kernel
+│
+│  ── Configuration ──
+├── config.py                      # AttentionConfig, AttentionFusion, HeadMapping
+├── mla_config.py                  # MLAConfig (separate concrete type)
+├── tmem_layout.py                 # TmemLayout: computed TMEM offsets
+├── warp_schedule.py               # WarpSchedule for FMHA (16 warps)
+├── mla_warp_schedule.py           # MLAWarpSchedule (6-8 warps)
+├── mainloop_spec.py               # MainloopSpec (FMHA), MLAMainloopSpec
+├── pipeline_topology.py           # PipelineTopology, PipelineEdge, PipelineType, factory
+│
+│  ── Warp Roles ──
+├── roles/
+│   ├── softmax.py                 # SoftmaxRole (FMHA)
+│   ├── correction.py              # CorrectionRole (FMHA)
+│   ├── mma.py                     # MmaRole (FMHA)
+│   ├── loader_tma.py              # LoaderRole (FMHA)
+│   ├── epilogue.py                # EpilogueRole (FMHA)
+│   ├── mla_loader.py              # MLALoaderRole
+│   ├── mla_mma.py                 # MLAMmaRole
+│   ├── mla_compute.py             # MLAComputeRole (orchestrator)
+│   ├── mla_softmax.py             # MLASoftmaxRole
+│   ├── mla_rescale.py             # MLARescaleRole
+│   ├── mla_epilogue.py            # MLAEpilogueRole
+│   ├── softmax_math.py            # Shared: exp2_scale, packed_row_sum
+│   └── tmem_utils.py              # Shared: tmem_load_partition
+│
+│  ── Fusion / Masking ──
+├── fusion/
+│   ├── mask.py                    # MaskType, apply_mask, trip count helpers
+│   ├── logits_transform.py        # sigmoid_logits_transform
+│   ├── output_transform.py        # dumb_output_transform
+│   └── softmax_modifier.py        # (stub) WithSink modifier
+│
+│  ── Schedulers ──
+├── scheduler/
+│   ├── persistent.py              # FmhaStaticTileScheduler
+│   └── mla_persistent.py          # MLAStaticTileScheduler
+│
+│  ── PyTorch Wrappers ──
+└── wrappers/
+    ├── batch_prefill.py           # BatchPrefillCuteDSLWrapper
+    └── batch_mla.py               # BatchMLAPagedAttentionWrapperCuteDSL
 ```
 
 ### Key Abstractions
@@ -581,57 +604,48 @@ gqa_decode = AttentionConfig(
 
 ---
 
-## 8. Migration Strategy
+## 8. Migration History
 
-Each step is independently valuable and testable against the existing monolithic implementation.
+Each step was independently testable against the existing monolithic implementation. The original monolithic files (`prefill.py`, `mla.py`) were preserved unchanged throughout.
 
-### Phase 1: Extract Configuration (Low Risk)
+### Phase 1: Extract Configuration -- DONE
 
-1. **Extract `AttentionConfig`** from scattered `self.xxx` attributes
-   - Immediate readability win
-   - Single source of truth for all tile sizes, dtypes, feature flags
+1. **`AttentionConfig`** / **`MLAConfig`** — separate concrete dataclasses for each variant's problem shape, tile sizes, dtypes, and feature flags
+2. **`TmemLayout`** — computed TMEM offsets derived from config, eliminating magic numbers
+3. **`AttentionFusion`** — customization bundle (logits/output transforms, attention sinks)
 
-2. **Extract `TmemLayout`** with computed offsets
-   - Eliminates magic numbers (0, 128, 256, 384, 32, 160)
-   - Enables auto-derivation for new tile sizes or head dimensions
+### Phase 2: Extract Warp Roles -- DONE
 
-### Phase 2: Extract Reusable Roles (Medium Risk)
+4. **FMHA roles**: `SoftmaxRole`, `CorrectionRole`, `MmaRole`, `LoaderRole`, `EpilogueRole` — each extracted as a class with `@cute.jit` methods
+5. **MLA roles**: `MLALoaderRole`, `MLAMmaRole`, `MLAComputeRole` (orchestrator delegating to `MLASoftmaxRole`, `MLARescaleRole`, `MLAEpilogueRole`)
+6. **Masking utilities**: `apply_mask()`, trip count helpers moved to `fusion/mask.py` as standalone `@cute.jit` functions
 
-3. **Extract `SoftmaxWarpGroup`** as a standalone class
-   - Most reusable piece: identical algorithm in prefill, decode, and MLA
-   - Takes `AttentionFusion` for mask/logits_transform/sink hooks
+### Phase 3: Extract Infrastructure -- DONE
 
-4. **Extract `CorrectionWarpGroup`** as a standalone class
-   - Reusable between prefill and decode
-   - Takes `AttentionFusion` for output_transform hooks
+7. **`PipelineTopology`** — declarative pipeline graph with `PipelineEdge` specs and `create_pipelines()` factory, replacing ~80 lines of imperative pipeline setup per kernel
+8. **`WarpSchedule`** / **`MLAWarpSchedule`** — warp role assignment and register budgets as dataclasses
+9. **`MainloopSpec`** / **`MLAMainloopSpec`** — bundles config + schedule + topology + stage counts (analogous to C++ mainloop collective types)
+10. **Tile schedulers**: `FmhaStaticTileScheduler`, `MLAStaticTileScheduler` extracted to `scheduler/`
 
-5. **Bundle `AttentionFusion`** to cleanly separate customization from plumbing
-   - Pre-built variants: `STANDARD`, `CAUSAL`, `SIGMOID`, `SINK_CAUSAL`
+### Phase 4: Extract Shared Utilities -- DONE
 
-### Phase 3: Extract Infrastructure (Medium Risk)
+11. **`softmax_math.py`**: `exp2_scale()`, `packed_row_sum()` — shared between FMHA `SoftmaxRole` and MLA `MLASoftmaxRole`
+12. **`tmem_utils.py`**: `tmem_load_partition()` — shared between `MLARescaleRole` and `MLAEpilogueRole`
 
-6. **Extract `LoaderTMA`** as a base class; specialize `MLALoaderTMA`
-   - Enables MLA to share softmax/correction with standard MHA
+### Phase 5: Performance Enhancements -- PENDING
 
-7. **Extract `PipelineTopology`** as a declarative pipeline graph
-   - Enables experimentation with different topologies
-   - Simplifies pipeline initialization code
+13. **Skip-correction** — `vote_all_sync` to avoid rescaling when unnecessary
+14. **Softmax software pipelining** — interleave FMA, exp2, dtype conversion
+15. **Fused atomic reduction** for split-KV (eliminates reduction kernel)
+16. **FP8 support** in config, loader, and MMA modules
 
-8. **Extract `WarpAssignment`** with named presets
-   - `prefill_standard()`, `decode_mla()`, etc.
+### Phase 6: New Features -- PENDING
 
-### Phase 4: Performance Enhancements
-
-9. **Add skip-correction** to `CorrectionWarpGroup`
-10. **Add softmax software pipelining** to `SoftmaxWarpGroup`
-11. **Add fused atomic reduction** as an alternative to the reduction kernel
-12. **Add FP8 support** to config, loader, and MMA modules
-
-### Phase 5: New Features
-
-13. **Causal-aware tile scheduling** with swizzled launch order
-14. **ThreadShape configurability** for different Q/K aspect ratios
-15. **Backward pass** (requires new kernel composition)
+17. **Causal-aware tile scheduling** with swizzled launch order
+18. **ThreadShape configurability** for different Q/K aspect ratios
+19. **Backward pass** (requires new kernel composition)
+20. **CollectiveBuilder** pattern to select MMA atoms, TMA descriptors, and pipeline types from config
+21. **Wire `AttentionFusion` into MLA** — extend customization hooks to MLA decode
 
 ---
 
@@ -789,3 +803,33 @@ Listed roughly in order of impact:
 | `kernel/sm100_fmha_gen_kernel_warpspecialized.hpp` | Gen/decode kernel |
 | `kernel/sm100_fmha_mla_tma_warpspecialized.hpp` | MLA inference kernel |
 | `kernel/sm100_fmha_mla_reduction.hpp` | MLA split-KV reduction |
+
+### Backward Compatibility
+
+The original monolithic files (`flashinfer/cute_dsl/prefill.py`, `flashinfer/cute_dsl/mla.py`) are preserved unchanged. The modular `attention/` package is used via its own entry points. A re-export shim pattern can be used to maintain backward compatibility:
+
+```python
+# flashinfer/cute_dsl/prefill.py (shim)
+from .attention.prefill import BlackwellFusedMultiHeadAttentionForward
+from .attention.wrappers.batch_prefill import (
+    BatchPrefillCuteDSLWrapper, qkv_torch_2_cute, create_and_pad_tensor,
+)
+from .attention.fusion.mask import MaskType
+from .attention.scheduler.persistent import (
+    FmhaStaticTileScheduler, FmhaStaticTileSchedulerParams,
+    create_fmha_static_tile_scheduler, create_fmha_static_tile_scheduler_params,
+)
+from .attention.fusion.logits_transform import sigmoid_logits_transform
+from .attention.fusion.output_transform import dumb_output_transform
+```
+
+### Refactoring Origin
+
+This modularization was derived from the monolithic `prefill.py` (2934 lines) and `mla.py` (3641 lines). Key extraction landmarks:
+
+- **`AttentionConfig`**: Extracted from `BlackwellFusedMultiHeadAttentionForward.__init__` scattered `self.xxx` attributes
+- **`TmemLayout`**: Extracted hardcoded magic numbers (0, 128, 256, 384, 32, 160) into a computed dataclass
+- **`FmhaStaticTileScheduler`**: Moved self-contained scheduler logic (originally lines 111-262 of `prefill.py`)
+- **`MaskType`**: Moved enum (originally lines 264-268 of `prefill.py`)
+- **Warp roles**: Each role class was extracted from methods of the monolithic `BlackwellFusedMultiHeadAttentionForward` class
+- **MLA**: Ported from `mla.py` following the same extraction pattern, with separate concrete types (`MLAConfig`, `MLAWarpSchedule`, `MLAMainloopSpec`)
