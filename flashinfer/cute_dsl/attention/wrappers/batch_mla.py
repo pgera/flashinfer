@@ -212,6 +212,8 @@ class BatchMLAPagedAttentionWrapperCuteDSL:
                 self._use_page_table,
                 page_size,
                 kv_len_arr,
+                kv_indptr=kv_indptr,
+                kv_indices=kv_indices,
             )
         )
         cluster_shape_mnk = self._cluster_shape_mnk

@@ -1373,17 +1373,35 @@ class BlackwellMultiLatentAttentionForward:
 
 
 def create_page_table(
-    batch_size, seq_len, is_var_seq, use_page_table, page_size, cache_seqs_torch
+    batch_size,
+    seq_len,
+    is_var_seq,
+    use_page_table,
+    page_size,
+    cache_seqs_torch,
+    kv_indptr=None,
+    kv_indices=None,
 ):
     page_table_ref, page_table, page_table_gpu = None, None, None
     if use_page_table:
         max_seq_len = seq_len if not is_var_seq else torch.max(cache_seqs_torch)
         page_count = ceil_div(max_seq_len, page_size)
         page_table_ref = torch.empty([batch_size, page_count], dtype=torch.int32)
-        # use transposed index for page table to make sure the value is in bound of `batch_size * seq_len_block`
-        for b in range(batch_size):
-            for j in range(page_count):
-                page_table_ref[b, j] = b + j * batch_size
+        if kv_indptr is not None and kv_indices is not None:
+            kv_indptr_cpu = kv_indptr.cpu()
+            kv_indices_cpu = kv_indices.cpu()
+            for b in range(batch_size):
+                start = kv_indptr_cpu[b].item()
+                end = kv_indptr_cpu[b + 1].item()
+                for j in range(page_count):
+                    if start + j < end:
+                        page_table_ref[b, j] = kv_indices_cpu[start + j].item()
+                    else:
+                        page_table_ref[b, j] = 0
+        else:
+            for b in range(batch_size):
+                for j in range(page_count):
+                    page_table_ref[b, j] = b + j * batch_size
         page_table_gpu = page_table_ref.permute(1, 0).cuda()
         page_table = from_dlpack(page_table_gpu, assumed_align=16).mark_layout_dynamic(
             leading_dim=0
