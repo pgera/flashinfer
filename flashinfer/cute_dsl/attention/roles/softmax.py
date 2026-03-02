@@ -249,10 +249,39 @@ class SoftmaxRole:
         ### di = di-1 * (e^(mi-1 - mi) * scale) + sum e^(xi*scale - mi*scale)
         vec_i_handle = si_corr_producer.acquire_and_advance()
         acc_scale_ = scale * (old_row_max - row_max_safe)
-        acc_scale = cute.arch.exp2(acc_scale_)
+        # * 0.5 compensates for initializing both packed elements with row_sum below
+        acc_scale = cute.arch.exp2(acc_scale_) * 0.5
         row_sum *= acc_scale
-        row_sum_vec = packed_row_sum(tTMEM_LOADrS)
-        row_sum = row_sum_vec[0] + row_sum_vec[1] + row_sum
+        # 4-way unrolled reduction for ILP: 4 independent accumulator chains
+        # run in parallel, then tree-reduce. local_row_sum_0 is seeded with
+        # (row_sum, row_sum) so the old running sum folds into the reduction.
+        local_row_sum_0 = (row_sum, row_sum)
+        local_row_sum_1 = (0.0, 0.0)
+        local_row_sum_2 = (0.0, 0.0)
+        local_row_sum_3 = (0.0, 0.0)
+
+        reduction_unroll = 4
+        frg_tile_r = cute.size(tTMEM_LOADrS) // reduction_unroll
+        tTMEM_LOADrS_frg_r = cute.logical_divide(tTMEM_LOADrS, cute.make_layout(frg_tile_r))
+
+        for j in cutlass.range_constexpr(0, cute.size(tTMEM_LOADrS_frg_r, mode=[0]), 2):
+            local_row_sum_0 = cute.arch.add_packed_f32x2(
+                local_row_sum_0, (tTMEM_LOADrS_frg_r[j, 0], tTMEM_LOADrS_frg_r[j + 1, 0])
+            )
+            local_row_sum_1 = cute.arch.add_packed_f32x2(
+                local_row_sum_1, (tTMEM_LOADrS_frg_r[j, 1], tTMEM_LOADrS_frg_r[j + 1, 1])
+            )
+            local_row_sum_2 = cute.arch.add_packed_f32x2(
+                local_row_sum_2, (tTMEM_LOADrS_frg_r[j, 2], tTMEM_LOADrS_frg_r[j + 1, 2])
+            )
+            local_row_sum_3 = cute.arch.add_packed_f32x2(
+                local_row_sum_3, (tTMEM_LOADrS_frg_r[j, 3], tTMEM_LOADrS_frg_r[j + 1, 3])
+            )
+
+        local_row_sum_0 = cute.arch.add_packed_f32x2(local_row_sum_0, local_row_sum_1)
+        local_row_sum_2 = cute.arch.add_packed_f32x2(local_row_sum_2, local_row_sum_3)
+        local_row_sum_0 = cute.arch.add_packed_f32x2(local_row_sum_0, local_row_sum_2)
+        row_sum = local_row_sum_0[0] + local_row_sum_0[1]
 
         return (
             row_max,
