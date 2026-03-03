@@ -18,15 +18,206 @@ import cutlass.cute as cute
 import cutlass.torch as cutlass_torch
 from cutlass.cute.runtime import from_dlpack
 
-from ..mla_decode import (
-    BlackwellMultiLatentAttentionForward,
-    create_page_table,
-    create_block_split_kvs,
-    create_workspace,
-    torch_to_cute,
-    create_tensor,
-    ceil_div,
-)
+from ..mla_decode import BlackwellMultiLatentAttentionForward
+
+
+def ceil_div(a: int, b: int) -> int:
+    return (a + b - 1) // b
+
+
+def create_page_table(
+    batch_size,
+    seq_len,
+    is_var_seq,
+    use_page_table,
+    page_size,
+    cache_seqs_torch,
+    kv_indptr=None,
+    kv_indices=None,
+):
+    page_table_ref, page_table, page_table_gpu = None, None, None
+    if use_page_table:
+        max_seq_len = seq_len if not is_var_seq else torch.max(cache_seqs_torch)
+        page_count = ceil_div(max_seq_len, page_size)
+        page_table_ref = torch.empty([batch_size, page_count], dtype=torch.int32)
+        if kv_indptr is not None and kv_indices is not None:
+            kv_indptr_cpu = kv_indptr.cpu()
+            kv_indices_cpu = kv_indices.cpu()
+            for b in range(batch_size):
+                start = kv_indptr_cpu[b].item()
+                end = kv_indptr_cpu[b + 1].item()
+                for j in range(page_count):
+                    if start + j < end:
+                        page_table_ref[b, j] = kv_indices_cpu[start + j].item()
+                    else:
+                        page_table_ref[b, j] = 0
+        else:
+            for b in range(batch_size):
+                for j in range(page_count):
+                    page_table_ref[b, j] = b + j * batch_size
+        page_table_gpu = page_table_ref.permute(1, 0).cuda()
+        page_table = from_dlpack(page_table_gpu, assumed_align=16).mark_layout_dynamic(
+            leading_dim=0
+        )
+    return page_table_ref, page_table, page_table_gpu
+
+
+def create_block_split_kvs(
+    batch_size,
+    split_kv,
+    cache_seqs_ref,
+    is_var_split_kv,
+    mma_qk_tiler_mn,
+    cluster_shape_mnk,
+    max_active_clusters,
+):
+    block_split_kvs_ref, block_split_kvs, block_split_kvs_gpu = None, None, None
+    if is_var_split_kv:
+        block_split_kvs_ref = torch.zeros([batch_size], dtype=torch.int32)
+        for b in range(batch_size):
+            block_split_kvs_ref[b] = BlackwellMultiLatentAttentionForward.get_split_kv(
+                batch_size,
+                cache_seqs_ref[b].item(),
+                mma_qk_tiler_mn,
+                max_active_clusters * cluster_shape_mnk[0],
+            )
+        split_kv = torch.max(block_split_kvs_ref).item()
+        block_split_kvs_gpu = block_split_kvs_ref.cuda()
+        block_split_kvs = from_dlpack(
+            block_split_kvs_gpu, assumed_align=16
+        ).mark_layout_dynamic()
+    elif split_kv <= 0:
+        split_kv = BlackwellMultiLatentAttentionForward.get_split_kv(
+            batch_size,
+            cache_seqs_ref[0].item(),
+            mma_qk_tiler_mn,
+            max_active_clusters * cluster_shape_mnk[0],
+        )
+    return split_kv, block_split_kvs_ref, block_split_kvs, block_split_kvs_gpu
+
+
+def create_workspace(num_heads, latent_dim, batch_size, split_kv, acc_dtype):
+    workspace_size = BlackwellMultiLatentAttentionForward.get_workspace_size(
+        num_heads,
+        latent_dim,
+        batch_size,
+        split_kv,
+        acc_dtype,
+    )
+
+    workspace, workspace_torch = None, None
+    if workspace_size > 0:
+        workspace_torch = torch.empty([workspace_size], dtype=torch.int8).cuda()
+        workspace = from_dlpack(workspace_torch, assumed_align=16)
+    return workspace, workspace_torch
+
+
+def torch_to_cute(
+    torch_tensor_gpu,
+    dtype,
+    is_dynamic_layout=True,
+    page_table=None,
+    page_size=None,
+    cache_seqs=None,
+    is_lse=False,
+):
+    if is_lse:
+        shape = torch_tensor_gpu.shape
+        B, HK = shape
+        permute_order = (1, 0)
+        stride_order = (1, 0)
+        leading_dim = 0
+    else:
+        shape = torch_tensor_gpu.shape
+        B, HK, D = shape
+        permute_order = (1, 2, 0)
+        stride_order = (2, 0, 1)
+        leading_dim = 1
+    if page_table is not None:
+        if cache_seqs is not None:
+            max_seq_len = torch.max(cache_seqs)
+            shape = (B * ceil_div(max_seq_len, page_size), page_size, D)
+        else:
+            shape = (B * ceil_div(HK, page_size), page_size, D)
+
+    torch_tensor_gpu = torch_tensor_gpu.permute(permute_order)
+
+    cute_tensor = from_dlpack(torch_tensor_gpu, assumed_align=16)
+    cute_tensor.element_type = dtype
+    if is_dynamic_layout:
+        cute_tensor = cute_tensor.mark_layout_dynamic(
+            leading_dim=leading_dim
+        ).mark_compact_shape_dynamic(
+            mode=leading_dim,
+            stride_order=stride_order,
+            divisibility=(128 // dtype.width),
+        )
+
+    cute_tensor = cutlass_torch.convert_cute_tensor(
+        torch_tensor_gpu,
+        cute_tensor,
+        dtype,
+        is_dynamic_layout=is_dynamic_layout,
+    )
+
+    return cute_tensor, torch_tensor_gpu
+
+
+def create_tensor(
+    B,
+    HK,
+    D,
+    dtype,
+    is_dynamic_layout=True,
+    page_table=None,
+    cache_seqs=None,
+    is_lse=False,
+    page_size=None,
+):
+    shape = (B, HK, D)
+    if page_table is not None:
+        if cache_seqs is not None:
+            max_seq_len = torch.max(cache_seqs)
+            shape = (B * ceil_div(max_seq_len, page_size), page_size, D)
+        else:
+            shape = (B * ceil_div(HK, page_size), page_size, D)
+    permute_order = (1, 2, 0)
+    stride_order = (2, 0, 1)
+    leading_dim = 1
+    if is_lse:
+        shape = (B, HK)
+        permute_order = (1, 0)
+        stride_order = (1, 0)
+        leading_dim = 0
+    init_config = cutlass.torch.RandomInitConfig(min_val=-2, max_val=2)
+    torch_dtype = cutlass_torch.dtype(dtype)
+    torch_tensor_cpu = cutlass_torch.create_and_permute_torch_tensor(
+        shape,
+        torch_dtype,
+        permute_order=permute_order,
+        init_type=cutlass.torch.TensorInitType.RANDOM,
+        init_config=init_config,
+    )
+    torch_tensor_gpu = torch_tensor_cpu.cuda()
+
+    cute_tensor = from_dlpack(torch_tensor_gpu, assumed_align=16)
+    cute_tensor.element_type = dtype
+
+    if is_dynamic_layout:
+        cute_tensor = cute_tensor.mark_layout_dynamic(
+            leading_dim=leading_dim
+        ).mark_compact_shape_dynamic(
+            mode=leading_dim,
+            stride_order=stride_order,
+            divisibility=(128 // dtype.width),
+        )
+    cute_tensor = cutlass_torch.convert_cute_tensor(
+        torch_tensor_gpu,
+        cute_tensor,
+        dtype,
+        is_dynamic_layout=is_dynamic_layout,
+    )
+    return cute_tensor, torch_tensor_gpu
 
 
 class BatchMLAPagedAttentionWrapperCuteDSL:
