@@ -36,18 +36,19 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
-import cutlass.cute.nvgpu.tcgen05 as tcgen05
+
 import cutlass.cute.nvgpu.cpasync as cpasync
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 import cutlass.torch as cutlass_torch
-import cutlass.utils.blackwell_helpers as sm100_utils
+
 from cutlass.cute.runtime import from_dlpack
 
 from .mla_config import MLAConfig
 from .mla_warp_schedule import MLAWarpSchedule, MLA_DECODE_SCHEDULE
 from .pipeline_topology import PipelineTopology, make_mla_topology
 from .mainloop_spec import MLAMainloopSpec, make_mla_mainloop_spec
+from .collective_builder import build_mla_launch_params
 from .roles.mla_loader import MLALoaderRole
 from .roles.mla_mma import MLAMmaRole
 from .roles.mla_compute import MLAComputeRole
@@ -114,53 +115,13 @@ class BlackwellMultiLatentAttentionForward:
         self.mma_role = None  # initialized after mainloop.resolve() sets stage counts
         self.compute_role = None  # initialized after mainloop.resolve() and dtypes known
 
-        # Unpack config onto self for backward compat with kernel body code
-        self.latent_dim = config.latent_dim
-        self.rope_dim = config.rope_dim
-        self.num_heads = config.num_heads
-        self.acc_dtype = config.acc_dtype
-        self.lse_dtype = config.lse_dtype
-        self.mma_qk_tiler_mn = config.mma_qk_tiler_mn
-        self.mma_pv_tiler_mn = config.mma_pv_tiler_mn
-        self.max_active_clusters = config.max_active_clusters
-        self.is_persistent = config.is_persistent
-        self.is_cpasync = config.is_cpasync
-        self.use_page_table = config.use_page_table
-        self.is_var_seq = config.is_var_seq
-        self.is_var_split_kv = config.is_var_split_kv
-        self.use_2cta_instrs = config.use_2cta_instrs
-        self.cluster_shape_mnk = config.cluster_shape_mnk
-        self.mma_qk_tiler = config.mma_qk_tiler
-        self.mma_pv_tiler = config.mma_pv_tiler
-        self.iterations_qk_latent = config.iterations_qk_latent
-        self.iterations_qk_rope = config.iterations_qk_rope
-        self.iterations_qk = config.iterations_qk
-        self.iterations_pv_k = config.iterations_pv_k
-        self.iterations_pv_n = config.iterations_pv_n
-
-        # Unpack warp schedule onto self for backward compat with kernel body code
-        sched = self.schedule
-        self.compute_warp_ids = sched.compute_warp_ids
-        self.mma_warp_id = sched.mma_warp_id
-        self.warps_in_n = sched.warps_in_n
-        self.num_compute_warps = sched.num_compute_warps
-        self.threads_per_warp = sched.threads_per_warp
-        self.num_load_warps = 2 if self.is_cpasync else 1
-        if self.is_cpasync:
-            self.load_cp_async_warp_ids = sched.load_cp_async_warp_ids
-            self.load_pt_warp_id = sched.load_pt_warp_id
-        else:
-            self.load_tma_warp_id = sched.load_tma_warp_id
-        self.threads_per_cta = sched.threads_per_cta(self.is_cpasync)
-
-        # Named barriers
         self.tmem_ptr_sync_bar = pipeline.NamedBarrier(
-            barrier_id=sched.tmem_ptr_sync_bar_id,
-            num_threads=sched.tmem_ptr_sync_num_threads,
+            barrier_id=self.schedule.tmem_ptr_sync_bar_id,
+            num_threads=self.schedule.tmem_ptr_sync_num_threads,
         )
         self.exchange_sync_bar = pipeline.NamedBarrier(
-            barrier_id=sched.exchange_sync_bar_id,
-            num_threads=sched.exchange_sync_num_threads,
+            barrier_id=self.schedule.exchange_sync_bar_id,
+            num_threads=self.schedule.exchange_sync_num_threads,
         )
 
     def _setup_attributes(self):
@@ -180,16 +141,6 @@ class BlackwellMultiLatentAttentionForward:
         )
         self.compute_role.q_dtype = self.q_dtype
         self.compute_role.o_dtype = self.o_dtype
-
-        # Unpack resolved stage counts onto self for backward compat
-        self.load_q_stage = self.mainloop.load_q_stages
-        self.load_kv_stage = self.mainloop.load_kv_stages
-        self.mma_s_stage = self.mainloop.mma_s_stages
-        self.p_mma_stage = self.mainloop.p_mma_stages
-        self.mma_o_stage = self.mainloop.mma_o_stages
-        self.load_pt_stage = self.mainloop.load_pt_stages
-        self.tmem_o_offset = self.mainloop.tmem_o_offset
-        self.topology = self.mainloop.pipeline_topology
 
     @cute.jit
     def __call__(
@@ -279,7 +230,7 @@ class BlackwellMultiLatentAttentionForward:
             q_latent.shape[1],
             q_latent.shape[2],
             split_kv,
-            self.acc_dtype,
+            self.config.acc_dtype,
             workspace,
         )
 
@@ -288,202 +239,37 @@ class BlackwellMultiLatentAttentionForward:
             c_latent.iterator, c_latent_tranpose_layout
         )
 
-        self.q_major_mode = tcgen05.OperandMajorMode.K
-        self.k_major_mode = tcgen05.OperandMajorMode.K
-        self.v_major_mode = tcgen05.OperandMajorMode.MN
-
         self._setup_attributes()
 
-        cta_group = tcgen05.CtaGroup.TWO
-        # the intermediate tensor p is from smem & k-major
-        p_major_mode = tcgen05.OperandMajorMode.K
-        qk_tiled_mma = sm100_utils.make_trivial_tiled_mma(
-            self.q_dtype,
-            self.q_major_mode,
-            self.k_major_mode,
-            self.acc_dtype,
-            cta_group,
-            self.mma_qk_tiler[:2],
+        lp = build_mla_launch_params(
+            self.mainloop, self.schedule,
+            q_latent, q_rope, c_latent, c_rope, c_latent_transpose,
+            self.q_dtype, self.k_dtype, self.v_dtype,
         )
-        pv_tiled_mma = sm100_utils.make_trivial_tiled_mma(
-            self.v_dtype,
-            p_major_mode,
-            self.v_major_mode,
-            self.acc_dtype,
-            cta_group,
-            self.mma_pv_tiler[:2],
-        )
-
-        cta_layout_vmnk = cute.tiled_divide(
-            cute.make_layout(self.cluster_shape_mnk),
-            (qk_tiled_mma.thr_id.shape,),
-        )
-
-        self.epi_tile = self.mma_pv_tiler[:2]
-
-        q_smem_layout_staged = sm100_utils.make_smem_layout_a(
-            qk_tiled_mma,
-            self.mma_qk_tiler,
-            self.q_dtype,
-            self.load_q_stage,
-        )
-        kc_smem_layout_staged = sm100_utils.make_smem_layout_b(
-            qk_tiled_mma,
-            self.mma_qk_tiler,
-            self.k_dtype,
-            self.load_kv_stage,
-        )
-        p_smem_layout_staged = sm100_utils.make_smem_layout_a(
-            pv_tiled_mma,
-            self.mma_pv_tiler,
-            self.q_dtype,
-            (self.iterations_pv_k * self.p_mma_stage),
-        )
-        p_smem_layout_staged = cute.logical_divide(
-            p_smem_layout_staged, (None, None, None, self.iterations_pv_k)
-        )
-        vc_smem_layout_staged = sm100_utils.make_smem_layout_b(
-            pv_tiled_mma,
-            self.mma_pv_tiler,
-            self.v_dtype,
-            self.load_kv_stage,
-        )
-
-        # TMA load for Q latent and rope
-        tma_load_op = cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp(cta_group)
-
-        q_smem_layout = cute.select(q_smem_layout_staged, mode=[0, 1, 2])
-        tma_atom_q_latent, tma_tensor_q_latent = cute.nvgpu.make_tiled_tma_atom_A(
-            tma_load_op,
-            q_latent,
-            q_smem_layout,
-            self.mma_qk_tiler,
-            qk_tiled_mma,
-            cta_layout_vmnk.shape,
-        )
-        tma_atom_q_rope, tma_tensor_q_rope = cute.nvgpu.make_tiled_tma_atom_A(
-            tma_load_op,
-            q_rope,
-            q_smem_layout,
-            self.mma_qk_tiler,
-            qk_tiled_mma,
-            cta_layout_vmnk.shape,
-        )
-        # TMA load for c latent and k rope
-        kc_smem_layout = cute.select(kc_smem_layout_staged, mode=[0, 1, 2])
-        tma_atom_c_latent, tma_tensor_c_latent = cute.nvgpu.make_tiled_tma_atom_B(
-            tma_load_op,
-            c_latent,
-            kc_smem_layout,
-            self.mma_qk_tiler,
-            qk_tiled_mma,
-            cta_layout_vmnk.shape,
-        )
-        tma_atom_c_rope, tma_tensor_c_rope = cute.nvgpu.make_tiled_tma_atom_B(
-            tma_load_op,
-            c_rope,
-            kc_smem_layout,
-            self.mma_qk_tiler,
-            qk_tiled_mma,
-            cta_layout_vmnk.shape,
-        )
-        # TMA load for c latent transpose
-        vc_smem_layout = cute.select(vc_smem_layout_staged, mode=[0, 1, 2])
-        tma_atom_c_latent_transpose, tma_tensor_c_latent_transpose = (
-            cute.nvgpu.make_tiled_tma_atom_B(
-                tma_load_op,
-                c_latent_transpose,
-                vc_smem_layout,
-                self.mma_pv_tiler,
-                pv_tiled_mma,
-                cta_layout_vmnk.shape,
-            )
-        )
-
-        q_copy_size = cute.size_in_bytes(self.q_dtype, q_smem_layout) * cute.size(
-            qk_tiled_mma.thr_id.shape
-        )
-        kc_copy_size = cute.size_in_bytes(self.k_dtype, kc_smem_layout) * cute.size(
-            qk_tiled_mma.thr_id.shape
-        )
-        vc_copy_size = cute.size_in_bytes(self.v_dtype, vc_smem_layout) * cute.size(
-            pv_tiled_mma.thr_id.shape
-        )
-        assert kc_copy_size == vc_copy_size, (
-            "kc_copy_size and vc_copy_size must be the same"
-        )
-
-        self.tma_copy_q_bytes = q_copy_size
-        self.tma_copy_kc_bytes = kc_copy_size
+        self.tma_copy_q_bytes = lp.tma_copy_q_bytes
+        self.tma_copy_kc_bytes = lp.tma_copy_kc_bytes
 
         tile_sched_params, grid = self._compute_grid(
-            o,
-            split_kv,
-            self.cluster_shape_mnk,
-            self.max_active_clusters,
-            self.is_persistent,
+            o, split_kv,
+            self.config.cluster_shape_mnk,
+            self.config.max_active_clusters,
+            self.config.is_persistent,
         )
 
-        @cute.struct
-        class SplitKVKernelSharedStorage:
-            # Pipeline barriers
-            load_q_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.load_q_stage * 2]
-            load_kv_mbar_ptr: cute.struct.MemRange[
-                cutlass.Int64, self.load_kv_stage * 2
-            ]
-            mma_s_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.mma_s_stage * 2]
-            p_mma_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.p_mma_stage * 2]
-            mma_o_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.mma_o_stage * 2]
-            load_pt_mbar_ptr: cute.struct.MemRange[
-                cutlass.Int64, self.load_pt_stage * 2
-            ]
-
-            # Smem tensors
-            smem_exchange: cute.struct.MemRange[
-                self.acc_dtype, self.num_compute_warps * self.threads_per_warp
-            ]
-
-            smem_page_table: cute.struct.MemRange[
-                cutlass.Int32, self.load_pt_stage * self.mma_qk_tiler[1]
-            ]
-            smem_q: cute.struct.Align[
-                cute.struct.MemRange[self.q_dtype, cute.cosize(q_smem_layout_staged)],
-                1024,
-            ]
-            smem_kc: cute.struct.Align[
-                cute.struct.MemRange[self.k_dtype, cute.cosize(kc_smem_layout_staged)],
-                1024,
-            ]
-            smem_p: cute.struct.Align[
-                cute.struct.MemRange[self.q_dtype, cute.cosize(p_smem_layout_staged)],
-                1024,
-            ]
-            # Tmem dealloc cluster barrier
-            tmem_dealloc_mbar_ptr: cutlass.Int64
-
-            # Tmem holding buffer
-            tmem_holding_buf: cutlass.Int32
-
-            @classmethod
-            def size_in_bytes(cls) -> int: ...  # noqa: F811
-
-            # ^ stub only; decorator fills real impl at runtime
-
         softmax_scale_log2 = softmax_scale * LOG2_E
-        # Launch the kernel synchronously
         self.split_kv_kernel(
-            qk_tiled_mma,
-            pv_tiled_mma,
-            tma_atom_q_latent,
-            tma_tensor_q_latent,
-            tma_atom_q_rope,
-            tma_tensor_q_rope,
-            tma_atom_c_latent,
-            tma_tensor_c_latent,
-            tma_atom_c_rope,
-            tma_tensor_c_rope,
-            tma_atom_c_latent_transpose,
-            tma_tensor_c_latent_transpose,
+            lp.qk_tiled_mma,
+            lp.pv_tiled_mma,
+            lp.tma_atom_q_latent,
+            lp.tma_tensor_q_latent,
+            lp.tma_atom_q_rope,
+            lp.tma_tensor_q_rope,
+            lp.tma_atom_c_latent,
+            lp.tma_tensor_c_latent,
+            lp.tma_atom_c_rope,
+            lp.tma_tensor_c_rope,
+            lp.tma_atom_c_latent_transpose,
+            lp.tma_tensor_c_latent_transpose,
             page_table,
             o,
             lse,
@@ -494,18 +280,18 @@ class BlackwellMultiLatentAttentionForward:
             block_split_kvs,
             softmax_scale_log2,
             output_scale,
-            q_smem_layout_staged,
-            kc_smem_layout_staged,
-            p_smem_layout_staged,
-            vc_smem_layout_staged,
-            cta_layout_vmnk,
+            lp.q_smem_layout_staged,
+            lp.kc_smem_layout_staged,
+            lp.p_smem_layout_staged,
+            lp.vc_smem_layout_staged,
+            lp.cta_layout_vmnk,
             tile_sched_params,
-            SplitKVKernelSharedStorage,
+            lp.SharedStorage,
         ).launch(
             grid=grid,
-            block=[self.threads_per_cta, 1, 1],
-            cluster=self.cluster_shape_mnk,
-            smem=SplitKVKernelSharedStorage.size_in_bytes(),
+            block=[self.schedule.threads_per_cta(self.config.is_cpasync), 1, 1],
+            cluster=self.config.cluster_shape_mnk,
+            smem=lp.SharedStorage.size_in_bytes(),
             stream=stream,
             min_blocks_per_mp=1,
         )
@@ -520,11 +306,26 @@ class BlackwellMultiLatentAttentionForward:
                 block_split_kvs,
             ).launch(
                 grid=(q_latent.shape[0], 1, q_latent.shape[2]),
-                block=[self.threads_per_warp * self.num_compute_warps, 1, 1],
-                smem=split_kv * self.acc_dtype.width // 8,
+                block=[self.schedule.threads_per_warp * self.schedule.num_compute_warps, 1, 1],
+                smem=split_kv * self.config.acc_dtype.width // 8,
                 stream=stream,
                 min_blocks_per_mp=1,
             )
+
+    @cute.jit
+    def _create_pipelines(self, storage, cta_layout_vmnk):
+        """Create all inter-warp pipelines from the topology and storage barriers."""
+        barrier_ptrs = {
+            "load_q": storage.load_q_mbar_ptr.data_ptr(),
+            "load_kv": storage.load_kv_mbar_ptr.data_ptr(),
+            "mma_s": storage.mma_s_mbar_ptr.data_ptr(),
+            "p_mma": storage.p_mma_mbar_ptr.data_ptr(),
+            "mma_o": storage.mma_o_mbar_ptr.data_ptr(),
+        }
+        tx_counts = {"q": self.tma_copy_q_bytes, "kv": self.tma_copy_kc_bytes}
+        return self.mainloop.pipeline_topology.create_pipelines_native(
+            barrier_ptrs, tx_counts, self.schedule.threads_per_warp, cta_layout_vmnk,
+        )
 
     @cute.kernel
     def split_kv_kernel(
@@ -559,77 +360,7 @@ class BlackwellMultiLatentAttentionForward:
         tile_sched_params: MLAStaticTileSchedulerParams,
         SharedStorage: cutlass.Constexpr,
     ):
-        """The device split_kv kernel implementation of the Multi-Head Latent Attention.
-
-        This kernel coordinates multiple specialized warps to perform different phases of the MLA computation:
-        1. Load warp: Loads Q/C latent/rope data from global memory to shared memory using TMA
-        2. MMA warp: Performs matrix multiplications (Q*K^T and P*V)
-        3. Compute warps: Compute softmax and do rescaling on accumulators, and store the intermediate/final results
-        to global memory
-
-        The kernel produces either intermediate or final results of the MLA computation based on the split_kv parameter.
-        When split_kv is 1, the kernel generates the final results directly. Otherwise, it produces intermediate results
-        that will later be combined by a reduction kernel.
-
-        The kernel implements a complex pipeline with overlapping computation and memory operations,
-        using tensor memory access (TMA) for efficient data loading, warp specialization for different
-        computation phases.
-
-        :param tiled_mma_qk: Tiled MMA for Q*K^T
-        :type tiled_mma_qk: cute.TiledMma
-        :param tiled_mma_pv: Tiled MMA for P*V
-        :type tiled_mma_pv: cute.TiledMma
-        :param tma_atom_q_latent: TMA copy atom for query latent tensor
-        :type tma_atom_q_latent: cute.CopyAtom
-        :param mQL: query latent tensor
-        :type mQL: cute.Tensor
-        :param tma_atom_q_rope: TMA copy atom for query rope tensor
-        :type tma_atom_q_rope: cute.CopyAtom
-        :param mKR: Compressed rope tensor
-        :type mKR: cute.Tensor
-        :param tma_atom_c_latent: TMA copy atom for c latent tensor
-        :type tma_atom_c_latent: cute.CopyAtom
-        :param mCL: Compressed latent tensor
-        :type mCL: cute.Tensor
-        :param tma_atom_c_rope: TMA copy atom for c rope tensor
-        :type tma_atom_c_rope: cute.CopyAtom
-        :param mCLT: Compressed latent transpose tensor
-        :type mCLT: cute.Tensor
-        :param mPT: Page table tensor
-        :type mPT: cute.Tensor
-        :param mO: Output tensor
-        :type mO: cute.Tensor
-        :param mLSE: Log-sum-exp tensor
-        :type mLSE: cute.Tensor
-        :param mAccO: Intermediate accumulator output tensor
-        :type mAccO: cute.Tensor
-        :param mAccLSE: Intermediate accumulator log-sum-exp tensor
-        :type mAccLSE: cute.Tensor
-        :param split_kv: The split_kv parameter
-        :type split_kv: cutlass.Int32
-        :param cache_seqs: The variable sequence length tensor
-        :type cache_seqs: cute.Tensor
-        :param block_split_kvs: The per-block split_kv values tensor
-        :type block_split_kvs: cute.Tensor
-        :param softmax_scale_log2: The log2 scale factor for softmax
-        :type softmax_scale_log2: cutlass.Float32
-        :param output_scale: The scale factor for the output
-        :type output_scale: cutlass.Float32
-        :param q_smem_layout_staged: Shared memory layout for query tensor
-        :type q_smem_layout_staged: cute.ComposedLayout
-        :param kc_smem_layout_staged: Shared memory layout for key tensor
-        :type kc_smem_layout_staged: cute.ComposedLayout
-        :param p_smem_layout_staged: Shared memory layout for probability matrix
-        :type p_smem_layout_staged: cute.ComposedLayout
-        :param vc_smem_layout_staged: Shared memory layout for value tensor
-        :type vc_smem_layout_staged: cute.ComposedLayout
-        :param cta_layout_vmnk: Layout for compute threads
-        :type cta_layout_vmnk: cute.Layout
-        :param tile_sched_params: Scheduling parameters for work distribution
-        :type tile_sched_params: MLAStaticTileSchedulerParams
-        :param SharedStorage: Shared storage for the kernel
-        :type SharedStorage: cutlass.Constexpr
-        """
+        """MLA split-KV device kernel: warp-specialized decode with pipelined TMA loads."""
 
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
@@ -659,65 +390,35 @@ class BlackwellMultiLatentAttentionForward:
         tmem_holding_buf = storage.tmem_holding_buf
 
         # Tensor memory dealloc barrier init
-        if warp_idx == self.load_tma_warp_id:
-            num_tmem_dealloc_threads = self.threads_per_warp * self.num_compute_warps
+        if warp_idx == self.schedule.load_tma_warp_id:
+            num_tmem_dealloc_threads = self.schedule.threads_per_warp * self.schedule.num_compute_warps
             with cute.arch.elect_one():
                 cute.arch.mbarrier_init(tmem_dealloc_mbar_ptr, num_tmem_dealloc_threads)
         cute.arch.mbarrier_init_fence()
 
-        barrier_ptrs = {
-            "load_q": storage.load_q_mbar_ptr.data_ptr(),
-            "load_kv": storage.load_kv_mbar_ptr.data_ptr(),
-            "mma_s": storage.mma_s_mbar_ptr.data_ptr(),
-            "p_mma": storage.p_mma_mbar_ptr.data_ptr(),
-            "mma_o": storage.mma_o_mbar_ptr.data_ptr(),
-        }
-        tx_counts = {
-            "q": self.tma_copy_q_bytes,
-            "kv": self.tma_copy_kc_bytes,
-        }
-        pipelines = self.topology.create_pipelines_native(
-            barrier_ptrs, tx_counts, self.threads_per_warp, cta_layout_vmnk
-        )
+        pipelines = self._create_pipelines(storage, cta_layout_vmnk)
         load_q_pipeline = pipelines["load_q"]
         load_kv_pipeline = pipelines["load_kv"]
         mma_s_pipeline = pipelines["mma_s"]
         p_mma_pipeline = pipelines["p_mma"]
         mma_o_pipeline = pipelines["mma_o"]
-        if cutlass.const_expr(self.is_cpasync):
-            # TODO: Implement page table loading pipeline
-            pass
 
         # Cluster arrive after barrier init
-        if cutlass.const_expr(cute.size(self.cluster_shape_mnk) > 1):
+        if cutlass.const_expr(cute.size(self.config.cluster_shape_mnk) > 1):
             cute.arch.cluster_arrive_relaxed()
 
-        # Generate smem tensor Q/KC/VC/exchange
-        # (MMA, MMA_H, MMA_R, PIPE)
-        sQ = storage.smem_q.get_tensor(
-            q_smem_layout_staged.outer, swizzle=q_smem_layout_staged.inner
-        )
-        # (MMA, MMA_K, MMA_R, PIPE)
-        sKC = storage.smem_kc.get_tensor(
-            kc_smem_layout_staged.outer, swizzle=kc_smem_layout_staged.inner
-        )
-        # (MMA, MMA_D, MMA_K, PIPE)
-        # reuse smem
-        sVC_ptr = cute.recast_ptr(sKC.iterator, vc_smem_layout_staged.inner)
-        sVC = cute.make_tensor(sVC_ptr, vc_smem_layout_staged.outer)
-        # (MMA, MMA_H, MMA_K)
-        sP = storage.smem_p.get_tensor(
-            p_smem_layout_staged.outer, swizzle=p_smem_layout_staged.inner
-        )
-        # (compute_threads,)
+        sQ = storage.smem_q.get_tensor(q_smem_layout_staged.outer, swizzle=q_smem_layout_staged.inner)
+        sKC = storage.smem_kc.get_tensor(kc_smem_layout_staged.outer, swizzle=kc_smem_layout_staged.inner)
+        sVC = cute.make_tensor(cute.recast_ptr(sKC.iterator, vc_smem_layout_staged.inner), vc_smem_layout_staged.outer)
+        sP = storage.smem_p.get_tensor(p_smem_layout_staged.outer, swizzle=p_smem_layout_staged.inner)
         smem_exchange = storage.smem_exchange.get_tensor(
-            cute.make_layout(self.num_compute_warps * self.threads_per_warp)
+            cute.make_layout(self.schedule.num_compute_warps * self.schedule.threads_per_warp)
         )
 
         #
         # Cluster wait before tensor memory alloc
         #
-        if cutlass.const_expr(cute.size(self.cluster_shape_mnk) > 1):
+        if cutlass.const_expr(cute.size(self.config.cluster_shape_mnk) > 1):
             cute.arch.cluster_wait()
         else:
             cute.arch.barrier()
@@ -725,10 +426,10 @@ class BlackwellMultiLatentAttentionForward:
         # ///////////////////////////////////////////////////////////////////////////////
         #  Load warps, including page table and data tensors
         # ///////////////////////////////////////////////////////////////////////////////
-        if cutlass.const_expr(self.is_cpasync):
+        if cutlass.const_expr(self.config.is_cpasync):
             # TODO: add cp async load variant.
             #  Load page table when isasync is true
-            # if warp_idx == self.load_pt_warp_id:
+            # if warp_idx == self.schedule.load_pt_warp_id:
             #     self.load_page_table()
             # if (
             #     warp_idx == self.load_cpasync_warp_id[0]
@@ -737,12 +438,12 @@ class BlackwellMultiLatentAttentionForward:
             #     load_cpasync()
             pass
         else:
-            if warp_idx == self.load_tma_warp_id:
+            if warp_idx == self.schedule.load_tma_warp_id:
                 load_q_producer_state = pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Producer, self.load_q_stage
+                    pipeline.PipelineUserType.Producer, self.mainloop.load_q_stages
                 )
                 load_kv_producer_state = pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Producer, self.load_kv_stage
+                    pipeline.PipelineUserType.Producer, self.mainloop.load_kv_stages
                 )
                 tile_sched = create_mla_static_tile_scheduler(
                     tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
@@ -805,12 +506,12 @@ class BlackwellMultiLatentAttentionForward:
         # ///////////////////////////////////////////////////////////////////////////////
         #  MMA warp
         # ///////////////////////////////////////////////////////////////////////////////
-        if warp_idx == self.mma_warp_id:
+        if warp_idx == self.schedule.mma_warp_id:
             # Alloc tensor memory buffer
             cute.arch.alloc_tmem(
                 cute.arch.SM100_TMEM_CAPACITY_COLUMNS,
                 tmem_holding_buf,
-                is_two_cta=self.use_2cta_instrs,
+                is_two_cta=self.config.use_2cta_instrs,
             )
 
             # sync with compute warp before tmem ptr is retrieved
@@ -818,25 +519,25 @@ class BlackwellMultiLatentAttentionForward:
 
             # Retrieving tensor memory ptr and make accumulator tensor
             tmem_ptr = cute.arch.retrieve_tmem_ptr(
-                self.acc_dtype,
+                self.config.acc_dtype,
                 alignment=16,
                 ptr_to_buffer_holding_addr=tmem_holding_buf,
             )
 
             load_q_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.load_q_stage
+                pipeline.PipelineUserType.Consumer, self.mainloop.load_q_stages
             )
             load_kv_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.load_kv_stage
+                pipeline.PipelineUserType.Consumer, self.mainloop.load_kv_stages
             )
             mma_s_producer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, self.mma_s_stage
+                pipeline.PipelineUserType.Producer, self.mainloop.mma_s_stages
             )
             p_mma_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.p_mma_stage
+                pipeline.PipelineUserType.Consumer, self.mainloop.p_mma_stages
             )
             mma_o_producer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, self.mma_o_stage
+                pipeline.PipelineUserType.Producer, self.mainloop.mma_o_stages
             )
             tile_sched = create_mla_static_tile_scheduler(
                 tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
@@ -895,37 +596,37 @@ class BlackwellMultiLatentAttentionForward:
             mma_s_pipeline.producer_tail(mma_s_producer_state)
             mma_o_pipeline.producer_tail(mma_o_producer_state)
 
-            cute.arch.relinquish_tmem_alloc_permit(is_two_cta=self.use_2cta_instrs)
+            cute.arch.relinquish_tmem_alloc_permit(is_two_cta=self.config.use_2cta_instrs)
             # Dealloc the tensor memory buffer
             cute.arch.mbarrier_wait(tmem_dealloc_mbar_ptr, 0)
 
             cute.arch.dealloc_tmem(
                 tmem_ptr,
                 cute.arch.SM100_TMEM_CAPACITY_COLUMNS,
-                is_two_cta=self.use_2cta_instrs,
+                is_two_cta=self.config.use_2cta_instrs,
             )
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  Compute warp
         # ///////////////////////////////////////////////////////////////////////////////
         if (
-            warp_idx >= self.compute_warp_ids[0]
-            and warp_idx <= self.compute_warp_ids[-1]
+            warp_idx >= self.schedule.compute_warp_ids[0]
+            and warp_idx <= self.schedule.compute_warp_ids[-1]
         ):
             mma_s_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.mma_s_stage
+                pipeline.PipelineUserType.Consumer, self.mainloop.mma_s_stages
             )
             p_mma_producer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, self.p_mma_stage
+                pipeline.PipelineUserType.Producer, self.mainloop.p_mma_stages
             )
             mma_o_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.mma_o_stage
+                pipeline.PipelineUserType.Consumer, self.mainloop.mma_o_stages
             )
             # sync with mma warp before retrieving tmem ptr
             self.tmem_ptr_sync_bar.wait()
 
             tmem_ptr = cute.arch.retrieve_tmem_ptr(
-                self.acc_dtype,
+                self.config.acc_dtype,
                 alignment=16,
                 ptr_to_buffer_holding_addr=tmem_holding_buf,
             )
@@ -1027,40 +728,40 @@ class BlackwellMultiLatentAttentionForward:
         tidx, _, _ = cute.arch.thread_idx()
         blk_coord = (bidx, 0, bidz)
         local_split_kv = (
-            block_split_kvs[blk_coord[2]] if self.is_var_split_kv else split_kv
+            block_split_kvs[blk_coord[2]] if self.config.is_var_split_kv else split_kv
         )
-        k_tile_total = cute.ceil_div(cache_seqs[blk_coord[2]], self.mma_qk_tiler[1])
+        k_tile_total = cute.ceil_div(cache_seqs[blk_coord[2]], self.config.mma_qk_tiler[1])
         k_tile_per_cta = cute.ceil_div(k_tile_total, local_split_kv)
         local_split_kv = cute.ceil_div(k_tile_total, k_tile_per_cta)
 
         # Alloc shared memory
         smem = utils.SmemAllocator()
-        storage = smem.allocate(MAX_SPLITS * self.acc_dtype.width // 8, 16)
-        lse_scale_ptr = cute.recast_ptr(storage, dtype=self.acc_dtype)
+        storage = smem.allocate(MAX_SPLITS * self.config.acc_dtype.width // 8, 16)
+        lse_scale_ptr = cute.recast_ptr(storage, dtype=self.config.acc_dtype)
         smem_lse_scale = cute.make_tensor(lse_scale_ptr, cute.make_layout(MAX_SPLITS))
 
         gLSE = mAccLSE[blk_coord[0], None, blk_coord[2]]
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         if warp_idx == 0:
             # calculate the global lse and exp ^ (local_lse - global_lse)
-            lse_per_thread = cute.ceil_div(MAX_SPLITS, self.threads_per_warp)
+            lse_per_thread = cute.ceil_div(MAX_SPLITS, self.schedule.threads_per_warp)
 
             local_lse = cute.make_fragment(
-                cute.make_layout(lse_per_thread), self.lse_dtype
+                cute.make_layout(lse_per_thread), self.config.lse_dtype
             )
-            lse_max = -self.lse_dtype.inf
+            lse_max = -self.config.lse_dtype.inf
             # find the max lse
             for i in range(lse_per_thread):
-                split_kv_idx = tidx + i * self.threads_per_warp
+                split_kv_idx = tidx + i * self.schedule.threads_per_warp
                 local_lse[i] = (
                     gLSE[split_kv_idx]
                     if cute.elem_less(split_kv_idx, local_split_kv)
-                    else -self.lse_dtype.inf
+                    else -self.config.lse_dtype.inf
                 )
                 # reduce the local lse
                 lse_max = cute.arch.fmax(lse_max, local_lse[i])
             lse_max = cute.arch.warp_reduction_max(lse_max)
-            lse_max = lse_max if lse_max != -self.lse_dtype.inf else 0.0
+            lse_max = lse_max if lse_max != -self.config.lse_dtype.inf else 0.0
             # calculate sum_lse
             sum_lse = 0.0
             for i in range(lse_per_thread):
@@ -1069,14 +770,14 @@ class BlackwellMultiLatentAttentionForward:
             # calculate the global_lse
             global_lse = (
                 lse_max + cute.math.log2(sum_lse)
-                if sum_lse != self.lse_dtype(0.0) or sum_lse != sum_lse
-                else self.lse_dtype.inf
+                if sum_lse != self.config.lse_dtype(0.0) or sum_lse != sum_lse
+                else self.config.lse_dtype.inf
             )
             if tidx == 0:
                 mLSE[blk_coord[0], blk_coord[2]] = global_lse
             # store the scale to shared memory
             for i in range(lse_per_thread):
-                split_kv_idx = tidx + i * self.threads_per_warp
+                split_kv_idx = tidx + i * self.schedule.threads_per_warp
                 if cute.elem_less(split_kv_idx, local_split_kv):
                     smem_lse_scale[split_kv_idx] = cute.arch.exp2(
                         local_lse[i] - global_lse
@@ -1085,19 +786,19 @@ class BlackwellMultiLatentAttentionForward:
         cute.arch.barrier()
 
         elements_per_thread = cute.ceil_div(
-            self.latent_dim, self.threads_per_warp * self.num_compute_warps
+            self.config.latent_dim, self.schedule.threads_per_warp * self.schedule.num_compute_warps
         )
         gAccO = mAccO[blk_coord[0], None, None, blk_coord[2]]
         rAccO = cute.make_fragment(
-            cute.make_layout(elements_per_thread), self.acc_dtype
+            cute.make_layout(elements_per_thread), self.config.acc_dtype
         )
         rAccO.fill(0.0)
         for i in range(local_split_kv):
             for j in range(elements_per_thread):
-                element_idx = tidx + j * self.threads_per_warp * self.num_compute_warps
+                element_idx = tidx + j * self.schedule.threads_per_warp * self.schedule.num_compute_warps
                 rAccO[j] += gAccO[i, element_idx] * smem_lse_scale[i]
         for j in range(elements_per_thread):
-            element_idx = tidx + j * self.threads_per_warp * self.num_compute_warps
+            element_idx = tidx + j * self.schedule.threads_per_warp * self.schedule.num_compute_warps
             mO[blk_coord[0], element_idx, blk_coord[2]] = rAccO[j].to(self.o_dtype)
         return
 
@@ -1150,10 +851,10 @@ class BlackwellMultiLatentAttentionForward:
         :rtype: tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32]
         """
         K = cache_seqs[blk_coord[2]]
-        if cutlass.const_expr(self.is_var_split_kv):
+        if cutlass.const_expr(self.config.is_var_split_kv):
             split_kv = block_split_kvs[blk_coord[2]]
 
-        k_tile_total = cute.ceil_div(K, self.mma_qk_tiler[1])
+        k_tile_total = cute.ceil_div(K, self.config.mma_qk_tiler[1])
         # {$nv-internal-release begin}
         # TODO: figure out the error of make_tile with dynamic int_tuple
         # {$nv-internal-release end}

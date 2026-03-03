@@ -37,15 +37,16 @@ import cutlass.cute as cute
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.utils as utils
 import cutlass.torch as cutlass_torch
-import cutlass.utils.blackwell_helpers as sm100_utils
+
 from cutlass.cute.runtime import from_dlpack
-from cutlass.cute.typing import Int32, Int64, Float32, Boolean
+from cutlass.cute.typing import Int32, Float32, Boolean
 
 from .config import AttentionConfig, AttentionFusion
 from .tmem_layout import TmemLayout
 from .warp_schedule import WarpSchedule, PREFILL_SCHEDULE
 from .pipeline_topology import PipelineTopology, make_prefill_topology
 from .mainloop_spec import MainloopSpec, make_prefill_mainloop_spec
+from .collective_builder import build_fmha_launch_params
 from .fusion.mask import (
     MaskType,
     apply_mask,
@@ -137,118 +138,36 @@ class BlackwellFusedMultiHeadAttentionForward:
     ):
         """Initializes a Blackwell Fused Multi-Head Attention (FMHA) kernel.
 
-        Accepts an AttentionConfig for core parameters and an optional
-        AttentionFusion for customization callbacks. Attributes are unpacked
-        onto self so the kernel body code remains unchanged.
-
         :param config: Core attention configuration (dtypes, tile shapes, mode).
-        :type config: AttentionConfig
         :param fusion: Optional customization callbacks (logits/output transforms, sinks).
-        :type fusion: AttentionFusion | None
         :param warp_schedule: Warp role assignment and register budgets. Defaults to PREFILL_SCHEDULE.
-        :type warp_schedule: WarpSchedule | None
         """
 
-        # Store structured config objects
         self.config = config
         self.fusion = fusion if fusion is not None else AttentionFusion()
         self.schedule = warp_schedule if warp_schedule is not None else PREFILL_SCHEDULE
         self.mainloop = make_prefill_mainloop_spec(config, self.schedule)
         self.tmem = self.mainloop.tmem_layout
 
-        # Unpack config onto self for backward compat with kernel body code
-        self.qk_acc_dtype = config.qk_acc_dtype
-        self.pv_acc_dtype = config.pv_acc_dtype
-        self.cta_tiler = config.cta_tiler
-        self.qk_mma_tiler = config.qk_mma_tiler
-        self.pv_mma_tiler = config.pv_mma_tiler
-        self.cluster_shape_mn = config.cluster_shape_mn
-        self.is_persistent = config.is_persistent
-        self.mask_type = config.mask_type
-        self.num_repeat_kv_heads = config.num_repeat_kv_heads
-        self.window_left = config.window_left
-
-        # Unpack warp schedule onto self for backward compat with kernel body code
-        sched = self.schedule
-        self.softmax0_warp_ids = sched.softmax0_warp_ids
-        self.softmax1_warp_ids = sched.softmax1_warp_ids
-        self.correction_warp_ids = sched.correction_warp_ids
-        self.mma_warp_id = sched.mma_warp_id
-        self.load_warp_id = sched.load_warp_id
-        self.epilogue_warp_id = sched.epilogue_warp_id
-        self.empty_warp_id = sched.empty_warp_id
-        self.tmem_alloc_cols = self.tmem.alloc_cols
-
-        self.threads_per_warp = sched.threads_per_warp
-        self.threads_per_cta = sched.threads_per_cta
-        self.cta_sync_bar_id = sched.cta_sync_bar_id
-        self.tmem_alloc_sync_bar_id = sched.tmem_alloc_sync_bar_id
-
-        # Unpack TMEM layout onto self
-        self.tmem_s0_offset = self.tmem.s0_offset
-        self.tmem_s1_offset = self.tmem.s1_offset
-        self.tmem_o0_offset = self.tmem.o0_offset
-        self.tmem_o1_offset = self.tmem.o1_offset
-        self.tmem_p0_offset = self.tmem.p0_offset
-        self.tmem_p1_offset = self.tmem.p1_offset
-        self.tmem_vec0_offset = self.tmem.vec0_offset
-        self.tmem_vec1_offset = self.tmem.vec1_offset
-
-        self.num_regs_softmax = sched.num_regs_softmax
-        self.num_regs_correction = sched.num_regs_correction
-        self.num_regs_other = sched.num_regs_other
-        self.num_regs_empty = sched.num_regs_empty
-
-        self.buffer_align_bytes = 1024
-        self.softmax_warpgroup_count = sched.softmax_warpgroup_count
-
-        # Unpack fusion onto self
-        self.custom_logits_transform = self.fusion.logits_transform is not None
-        self.logits_transform = self.fusion.logits_transform
-        self.custom_output_transform = self.fusion.output_transform is not None
-        self.output_transform = self.fusion.output_transform
-        self.custom_params = self.fusion.custom_params
-        self.custom_M_D_update = self.fusion.M_D_update is not None
-        self.M_D_update = self.fusion.M_D_update
-        self.use_attention_sink = self.fusion.use_attention_sink
-
-        # Create roles
         self.softmax_role = SoftmaxRole(
-            config, fusion, self.tmem,
-            softmax0_warp_ids=self.softmax0_warp_ids,
-            softmax1_warp_ids=self.softmax1_warp_ids,
-            threads_per_warp=self.threads_per_warp,
+            config, self.fusion, self.tmem,
+            softmax0_warp_ids=self.schedule.softmax0_warp_ids,
+            softmax1_warp_ids=self.schedule.softmax1_warp_ids,
+            threads_per_warp=self.schedule.threads_per_warp,
         )
         self.correction_role = CorrectionRole(
-            config, fusion, self.tmem,
-            correction_warp_ids=self.correction_warp_ids,
-            threads_per_warp=self.threads_per_warp,
+            config, self.fusion, self.tmem,
+            correction_warp_ids=self.schedule.correction_warp_ids,
+            threads_per_warp=self.schedule.threads_per_warp,
         )
         self.epilogue_role = EpilogueRole(config)
         self.loader_role = LoaderRole(config)
         self.mma_role = MmaRole(
             config,
-            tmem_alloc_cols=self.tmem_alloc_cols,
-            tmem_alloc_sync_bar_id=self.tmem_alloc_sync_bar_id,
-            threads_per_warp=self.threads_per_warp,
+            tmem_alloc_cols=self.tmem.alloc_cols,
+            tmem_alloc_sync_bar_id=self.schedule.tmem_alloc_sync_bar_id,
+            threads_per_warp=self.schedule.threads_per_warp,
         )
-
-    def _setup_attributes(self):
-        """Set up configurations and parameters for the FMHA kernel operation.
-
-        Resolves dtype-dependent stage counts via MainloopSpec, then unpacks
-        stage counts onto self for backward compat with SharedStorage and kernel code.
-        """
-
-        self.mainloop.resolve(self.q_dtype.width)
-
-        self.q_stage = self.mainloop.q_stages
-        self.kv_stage = self.mainloop.kv_stages
-        self.acc_stage = self.mainloop.acc_stage
-        self.softmax_corr_stage = self.mainloop.softmax_corr_stage
-        self.mma_corr_stage = self.mainloop.mma_corr_stage
-        self.mma_softmax_stage = self.mainloop.mma_softmax_stage
-        self.epi_stage = self.mainloop.epi_stage
 
     @cute.jit
     def __call__(
@@ -345,7 +264,7 @@ class BlackwellFusedMultiHeadAttentionForward:
 
         sink = (
             cute.make_tensor(sink_iter, cute.make_layout((h_q,)))
-            if self.use_attention_sink
+            if self.fusion.use_attention_sink
             else None
         )
 
@@ -360,8 +279,8 @@ class BlackwellFusedMultiHeadAttentionForward:
 
         self.tile_sched_params, grid = self._compute_grid(
             cute.shape((s_q, d, ((h_r, h_k), b))),
-            self.cta_tiler,
-            self.is_persistent,
+            self.config.cta_tiler,
+            self.config.is_persistent,
         )
 
         self.q_major_mode = utils.LayoutEnum.from_tensor(q).mma_major_mode()
@@ -381,188 +300,95 @@ class BlackwellFusedMultiHeadAttentionForward:
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.k_dtype}")
         if cutlass.const_expr(self.q_dtype != self.v_dtype):
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.v_dtype}")
-        self._setup_attributes()
+        self.mainloop.resolve(self.q_dtype.width)
 
-        cta_group = tcgen05.CtaGroup.ONE
-        # the intermediate tensor p is from tmem & k-major
-        p_source = tcgen05.OperandSource.TMEM
-        p_major_mode = tcgen05.OperandMajorMode.K
-        qk_tiled_mma = sm100_utils.make_trivial_tiled_mma(
-            self.q_dtype,
-            self.q_major_mode,
-            self.k_major_mode,
-            self.qk_acc_dtype,
-            cta_group,
-            self.qk_mma_tiler[:2],
+        lp = build_fmha_launch_params(
+            self.mainloop, q, k, v, o,
+            self.q_dtype, self.k_dtype, self.v_dtype, self.o_dtype,
+            self.q_major_mode, self.k_major_mode, self.v_major_mode, self.o_layout,
         )
-        pv_tiled_mma = sm100_utils.make_trivial_tiled_mma(
-            self.v_dtype,
-            p_major_mode,
-            self.v_major_mode,
-            self.pv_acc_dtype,
-            cta_group,
-            self.pv_mma_tiler[:2],
-            p_source,
-        )
+        self.shared_storage = lp.SharedStorage
+        self.tma_copy_q_bytes = lp.tma_copy_q_bytes
+        self.tma_copy_kv_bytes = lp.tma_copy_kv_bytes
 
-        self.cluster_shape_mnk = (*self.cluster_shape_mn, 1)
-        self.cluster_layout_vmnk = cute.tiled_divide(
-            cute.make_layout(self.cluster_shape_mnk),
-            (qk_tiled_mma.thr_id.shape,),
-        )
+        self.correction_role.set_call_attrs(self.o_dtype, lp.o_layout, lp.epi_tile)
 
-        self.epi_tile = self.pv_mma_tiler[:2]
-
-        # Propagate call-time attrs to correction role
-        self.correction_role.set_call_attrs(self.o_dtype, self.o_layout, self.epi_tile)
-
-        q_smem_layout_staged = sm100_utils.make_smem_layout_a(
-            qk_tiled_mma,
-            self.qk_mma_tiler,
-            self.q_dtype,
-            self.q_stage,
-        )
-        k_smem_layout_staged = sm100_utils.make_smem_layout_b(
-            qk_tiled_mma,
-            self.qk_mma_tiler,
-            self.k_dtype,
-            self.kv_stage,
-        )
-        p_tmem_layout_staged = sm100_utils.make_smem_layout_a(
-            pv_tiled_mma,
-            self.pv_mma_tiler,
-            self.q_dtype,
-            self.acc_stage,
-        )
-        v_smem_layout_staged = sm100_utils.make_smem_layout_b(
-            pv_tiled_mma,
-            self.pv_mma_tiler,
-            self.v_dtype,
-            self.kv_stage,
-        )
-        o_smem_layout_staged = sm100_utils.make_smem_layout_epi(
-            self.o_dtype,
-            self.o_layout,
-            self.epi_tile,
-            self.epi_stage,
-        )
-
-        # TMA load for Q
-        tma_load_op = cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp(cta_group)
-        tma_store_op = cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp()
-
-        q_smem_layout = cute.select(q_smem_layout_staged, mode=[0, 1, 2])
-        tma_atom_q, tma_tensor_q = cute.nvgpu.make_tiled_tma_atom_A(
-            tma_load_op,
-            q,
-            q_smem_layout,
-            self.qk_mma_tiler,
-            qk_tiled_mma,
-            self.cluster_layout_vmnk.shape,
-        )
-        # TMA load for K
-        k_smem_layout = cute.select(k_smem_layout_staged, mode=[0, 1, 2])
-        tma_atom_k, tma_tensor_k = cute.nvgpu.make_tiled_tma_atom_B(
-            tma_load_op,
-            k,
-            k_smem_layout,
-            self.qk_mma_tiler,
-            qk_tiled_mma,
-            self.cluster_layout_vmnk.shape,
-        )
-        # TMA load for V
-        v_smem_layout = cute.select(v_smem_layout_staged, mode=[0, 1, 2])
-        tma_atom_v, tma_tensor_v = cute.nvgpu.make_tiled_tma_atom_B(
-            tma_load_op,
-            v,
-            v_smem_layout,
-            self.pv_mma_tiler,
-            pv_tiled_mma,
-            self.cluster_layout_vmnk.shape,
-        )
-
-        o_smem_layout = cute.select(o_smem_layout_staged, mode=[0, 1])
-
-        tma_atom_o, tma_tensor_o = cute.nvgpu.cpasync.make_tiled_tma_atom(
-            tma_store_op,
-            o,
-            o_smem_layout,
-            self.epi_tile,
-        )
-
-        q_copy_size = cute.size_in_bytes(self.q_dtype, q_smem_layout)
-        k_copy_size = cute.size_in_bytes(self.k_dtype, k_smem_layout)
-        self.tma_copy_q_bytes = q_copy_size
-        self.tma_copy_kv_bytes = k_copy_size
-
-        @cute.struct
-        class SharedStorage:
-            # Pipeline barriers
-            load_q_mbar_ptr: cute.struct.MemRange[Int64, self.q_stage * 2]
-            load_kv_mbar_ptr: cute.struct.MemRange[Int64, self.kv_stage * 2]
-            mma_s0_mbar_ptr: cute.struct.MemRange[Int64, self.mma_softmax_stage * 2]
-            mma_s1_mbar_ptr: cute.struct.MemRange[Int64, self.mma_softmax_stage * 2]
-            s0_corr_mbar_ptr: cute.struct.MemRange[Int64, self.softmax_corr_stage * 2]
-            s1_corr_mbar_ptr: cute.struct.MemRange[Int64, self.softmax_corr_stage * 2]
-            s0_s1_sequence_mbar_ptr: cute.struct.MemRange[
-                Int64, self.softmax_warpgroup_count
-            ]
-            corr_epi_mbar_ptr: cute.struct.MemRange[Int64, self.epi_stage * 2]
-            mma_corr_mbar_ptr: cute.struct.MemRange[Int64, self.mma_corr_stage * 2]
-            tmem_dealloc_mbar_ptr: cute.struct.MemRange[Int64, 1]
-            # Tmem holding buffer
-            tmem_holding_buf: Int32
-            # Smem tensors
-            sO: cute.struct.Align[
-                cute.struct.MemRange[self.o_dtype, cute.cosize(o_smem_layout_staged)],
-                self.buffer_align_bytes,
-            ]
-            sQ: cute.struct.Align[
-                cute.struct.MemRange[self.q_dtype, cute.cosize(q_smem_layout_staged)],
-                self.buffer_align_bytes,
-            ]
-            sK: cute.struct.Align[
-                cute.struct.MemRange[self.k_dtype, cute.cosize(k_smem_layout_staged)],
-                self.buffer_align_bytes,
-            ]
-
-            @classmethod
-            def size_in_bytes(cls) -> int: ...  # noqa: F811
-
-            # ^ stub only; decorator fills real impl at runtime
-
-        self.shared_storage = SharedStorage
-
-        # Launch the kernel synchronously
         self.kernel(
-            qk_tiled_mma,
-            pv_tiled_mma,
-            tma_atom_q,
-            tma_tensor_q,
-            tma_atom_k,
-            tma_tensor_k,
-            tma_atom_v,
-            tma_tensor_v,
-            tma_atom_o,
-            tma_tensor_o,
+            lp.qk_tiled_mma,
+            lp.pv_tiled_mma,
+            lp.tma_atom_q,
+            lp.tma_tensor_q,
+            lp.tma_atom_k,
+            lp.tma_tensor_k,
+            lp.tma_atom_v,
+            lp.tma_tensor_v,
+            lp.tma_atom_o,
+            lp.tma_tensor_o,
             cum_seqlen_q,
             cum_seqlen_k,
             scale_softmax_log2,
             scale_output,
             sink,
-            q_smem_layout_staged,
-            k_smem_layout_staged,
-            p_tmem_layout_staged,
-            v_smem_layout_staged,
-            o_smem_layout_staged,
+            lp.q_smem_layout_staged,
+            lp.k_smem_layout_staged,
+            lp.p_tmem_layout_staged,
+            lp.v_smem_layout_staged,
+            lp.o_smem_layout_staged,
             self.tile_sched_params,
         ).launch(
             grid=grid,
-            block=[self.threads_per_cta, 1, 1],
-            cluster=self.cluster_shape_mnk,
-            smem=self.shared_storage.size_in_bytes(),
+            block=[self.schedule.threads_per_cta, 1, 1],
+            cluster=lp.cluster_shape_mnk,
+            smem=lp.SharedStorage.size_in_bytes(),
             stream=stream,
             min_blocks_per_mp=1,
+        )
+
+    @cute.jit
+    def _create_pipelines(self, storage):
+        """Create all inter-warp pipelines from the topology and storage barriers."""
+        barrier_ptrs = {
+            edge.name: getattr(storage, edge.barrier_field_name).data_ptr()
+            for edge in self.mainloop.pipeline_topology.edges
+        }
+        tx_counts = {"q": self.tma_copy_q_bytes, "kv": self.tma_copy_kv_bytes}
+        return self.mainloop.pipeline_topology.create_pipelines(
+            barrier_ptrs, tx_counts, self.schedule.threads_per_warp,
+        )
+
+    @cute.jit
+    def _create_mma_fragments(
+        self, qk_tiled_mma, pv_tiled_mma, sQ, sK, sV, p_tmem_layout_staged,
+    ):
+        """Partition MMA operands and create TMEM offset tensors for double-buffered accumulators."""
+        qk_thr_mma = qk_tiled_mma.get_slice(0)
+        pv_thr_mma = pv_tiled_mma.get_slice(0)
+        tSrQ = qk_thr_mma.make_fragment_A(sQ)
+        tSrK = qk_thr_mma.make_fragment_B(sK)
+        tOrV = pv_thr_mma.make_fragment_B(sV)
+
+        tStS = qk_thr_mma.make_fragment_C(qk_thr_mma.partition_shape_C(
+            (self.config.qk_mma_tiler[0], self.config.qk_mma_tiler[1])
+        ))
+        tOtO = pv_thr_mma.make_fragment_C(pv_thr_mma.partition_shape_C(
+            (self.config.pv_mma_tiler[0], self.config.pv_mma_tiler[1])
+        ))
+
+        tStS0 = cute.make_tensor(tStS.iterator + self.tmem.s0_offset, tStS.layout)
+        tStS1 = cute.make_tensor(tStS.iterator + self.tmem.s1_offset, tStS.layout)
+        tOtO0 = cute.make_tensor(tOtO.iterator + self.tmem.o0_offset, tOtO.layout)
+        tOtO1 = cute.make_tensor(tOtO.iterator + self.tmem.o1_offset, tOtO.layout)
+
+        tP = cute.make_tensor(tStS.iterator, p_tmem_layout_staged.outer)
+        tOrP = pv_thr_mma.make_fragment_A(tP)[None, None, None, 0]
+        p_scale = self.config.qk_acc_dtype.width // self.q_dtype.width
+        tOrP0 = cute.make_tensor(tOrP.iterator + p_scale * self.tmem.p0_offset, tOrP.layout)
+        tOrP1 = cute.make_tensor(tOrP.iterator + p_scale * self.tmem.p1_offset, tOrP.layout)
+
+        return (
+            qk_thr_mma, pv_thr_mma,
+            tSrQ, tSrK, tOrV, tStS,
+            tStS0, tStS1, tOtO0, tOtO1, tOrP0, tOrP1,
         )
 
     #  GPU device kernel
@@ -591,85 +417,21 @@ class BlackwellFusedMultiHeadAttentionForward:
         o_smem_layout_staged: cute.ComposedLayout,
         tile_sched_params: FmhaStaticTileSchedulerParams,
     ):
-        """The device kernel implementation of the Fused Multi-Head Attention.
-
-        This kernel coordinates multiple specialized warps to perform different phases of the FMHA computation:
-        1. Load warp: Loads Q, K, V data from global memory to shared memory using TMA
-        2. MMA warp: Performs matrix multiplications (Q*K^T and P*V)
-        3. Softmax warps: Compute softmax normalization on attention scores
-        4. Correction warps: Apply adjustments to intermediate results
-        5. Epilogue warp: Handles final output transformation and storage
-
-        The kernel implements a complex pipeline with overlapping computation and memory operations,
-        using tensor memory access (TMA) for efficient data loading, warp specialization for different
-        computation phases, and optional attention masking.
-
-        :param qk_tiled_mma: Tiled MMA for Q*K^T
-        :type qk_tiled_mma: cute.TiledMma
-        :param pv_tiled_mma: Tiled MMA for P*V
-        :type pv_tiled_mma: cute.TiledMma
-        :param tma_atom_q: TMA copy atom for query tensor
-        :type tma_atom_q: cute.CopyAtom
-        :param mQ_qdl: Partitioned query tensor
-        :type mQ_qdl: cute.Tensor
-        :param tma_atom_k: TMA copy atom for key tensor
-        :type tma_atom_k: cute.CopyAtom
-        :param mK_kdl: Partitioned key tensor
-        :type mK_kdl: cute.Tensor
-        :param tma_atom_v: TMA copy atom for value tensor
-        :type tma_atom_v: cute.CopyAtom
-        :param mV_dkl: Partitioned value tensor
-        :type mV_dkl: cute.Tensor
-        :param tma_atom_o: TMA copy atom for output tensor
-        :type tma_atom_o: cute.CopyAtom
-        :param mO_qdl: Partitioned output tensor
-        :type mO_qdl: cute.Tensor
-        :param scale_softmax_log2: The log2 scale factor for softmax
-        :type scale_softmax_log2: Float32
-        :param scale_output: The scale factor for the output
-        :type scale_output: Float32
-        :param sink: The sink tensor
-        :type sink: cute.Tensor | None
-        :param q_smem_layout_staged: Shared memory layout for query tensor
-        :type q_smem_layout_staged: cute.ComposedLayout
-        :param k_smem_layout_staged: Shared memory layout for key tensor
-        :type k_smem_layout_staged: cute.ComposedLayout
-        :param p_tmem_layout_staged: Tensor memory layout for probability matrix
-        :type p_tmem_layout_staged: cute.ComposedLayout
-        :param v_smem_layout_staged: Shared memory layout for value tensor
-        :type v_smem_layout_staged: cute.ComposedLayout
-        :param o_smem_layout_staged: Shared memory layout for output tensor
-        :type o_smem_layout_staged: cute.ComposedLayout
-        :param tile_sched_params: Scheduling parameters for work distribution
-        :type tile_sched_params: FmhaStaticTileSchedulerParams
-        """
+        """FMHA device kernel: warp-specialized attention with pipelined TMA loads."""
 
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-        # coord inside cta
         tidx, _, _ = cute.arch.thread_idx()
 
-        #
-        # Prefetch tma desc
-        #
-        if warp_idx == self.load_warp_id:
+        if warp_idx == self.schedule.load_warp_id:
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_q)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_k)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_v)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_o)
 
-        # Alloc
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
-        # Create all pipelines from topology
-        barrier_ptrs = {
-            edge.name: getattr(storage, edge.barrier_field_name).data_ptr()
-            for edge in self.mainloop.pipeline_topology.edges
-        }
-        tx_counts = {"q": self.tma_copy_q_bytes, "kv": self.tma_copy_kv_bytes}
-        pipes = self.mainloop.pipeline_topology.create_pipelines(
-            barrier_ptrs, tx_counts, self.threads_per_warp,
-        )
+        pipes = self._create_pipelines(storage)
         load_q_producer, load_q_consumer = pipes["load_q"]
         load_kv_producer, load_kv_consumer = pipes["load_kv"]
         mma_s0_producer, mma_s0_consumer = pipes["mma_s0"]
@@ -681,76 +443,41 @@ class BlackwellFusedMultiHeadAttentionForward:
         s0_s1_sequence_producer, s0_s1_sequence_consumer = pipes["s0_s1_sequence"]
         tmem_dealloc_mbar_ptr = storage.tmem_dealloc_mbar_ptr.data_ptr()
 
-        #  Correction & Epilogue & tmem barrier init
-        if warp_idx == self.empty_warp_id:
+        if warp_idx == self.schedule.empty_warp_id:
             cute.arch.mbarrier_init(
                 tmem_dealloc_mbar_ptr,
                 self.schedule.tmem_dealloc_arrive_count,
             )
         cute.arch.mbarrier_init_fence()
 
-        #  Generate smem tensor Q/K/V/O
-        # (MMA, MMA_Q, MMA_D, PIPE)
-        sQ = storage.sQ.get_tensor(
-            q_smem_layout_staged.outer, swizzle=q_smem_layout_staged.inner
-        )
-        # (MMA, MMA_K, MMA_D, PIPE)
-        sK = storage.sK.get_tensor(
-            k_smem_layout_staged.outer, swizzle=k_smem_layout_staged.inner
-        )
-        # (MMA, MMA_K, MMA_D, PIPE)
-        # Strip swizzle info to reuse smem
-        sV_ptr = cute.recast_ptr(sK.iterator, v_smem_layout_staged.inner)
-        sV = cute.make_tensor(sV_ptr, v_smem_layout_staged.outer)
-        sO = storage.sO.get_tensor(
-            o_smem_layout_staged.outer, swizzle=o_smem_layout_staged.inner
-        )
-        qk_thr_mma = qk_tiled_mma.get_slice(0)  # default 1sm
-        pv_thr_mma = pv_tiled_mma.get_slice(0)  # default 1sm
-        tSrQ = qk_thr_mma.make_fragment_A(sQ)
-        tSrK = qk_thr_mma.make_fragment_B(sK)
-        tOrV = pv_thr_mma.make_fragment_B(sV)
-        qk_acc_shape = qk_thr_mma.partition_shape_C(
-            (self.qk_mma_tiler[0], self.qk_mma_tiler[1])
-        )
-        tStS = qk_thr_mma.make_fragment_C(qk_acc_shape)
-        pv_acc_shape = pv_thr_mma.partition_shape_C(
-            (self.pv_mma_tiler[0], self.pv_mma_tiler[1])
-        )
-        tOtO = pv_thr_mma.make_fragment_C(pv_acc_shape)
+        sQ = storage.sQ.get_tensor(q_smem_layout_staged.outer, swizzle=q_smem_layout_staged.inner)
+        sK = storage.sK.get_tensor(k_smem_layout_staged.outer, swizzle=k_smem_layout_staged.inner)
+        sV = cute.make_tensor(cute.recast_ptr(sK.iterator, v_smem_layout_staged.inner), v_smem_layout_staged.outer)
+        sO = storage.sO.get_tensor(o_smem_layout_staged.outer, swizzle=o_smem_layout_staged.inner)
 
-        tStS0 = cute.make_tensor(tStS.iterator + self.tmem_s0_offset, tStS.layout)
-        tStS1 = cute.make_tensor(tStS.iterator + self.tmem_s1_offset, tStS.layout)
-        tOtO0 = cute.make_tensor(tOtO.iterator + self.tmem_o0_offset, tOtO.layout)
-        tOtO1 = cute.make_tensor(tOtO.iterator + self.tmem_o1_offset, tOtO.layout)
+        (
+            qk_thr_mma, pv_thr_mma,
+            tSrQ, tSrK, tOrV, tStS,
+            tStS0, tStS1, tOtO0, tOtO1, tOrP0, tOrP1,
+        ) = self._create_mma_fragments(
+            qk_tiled_mma, pv_tiled_mma, sQ, sK, sV, p_tmem_layout_staged,
+        )
 
-        tP = cute.make_tensor(tStS.iterator, p_tmem_layout_staged.outer)
-        tOrP = pv_thr_mma.make_fragment_A(tP)[None, None, None, 0]
-        tOrP0 = cute.make_tensor(
-            tOrP.iterator
-            + self.qk_acc_dtype.width // self.q_dtype.width * self.tmem_p0_offset,
-            tOrP.layout,
-        )
-        tOrP1 = cute.make_tensor(
-            tOrP.iterator
-            + self.qk_acc_dtype.width // self.q_dtype.width * self.tmem_p1_offset,
-            tOrP.layout,
-        )
         cute.arch.barrier(
-            barrier_id=self.cta_sync_bar_id,
-            number_of_threads=self.threads_per_cta,
+            barrier_id=self.schedule.cta_sync_bar_id,
+            number_of_threads=self.schedule.threads_per_cta,
         )
         # ///////////////////////////////////////////////////////////////////////////////
         #  EMPTY
         # ///////////////////////////////////////////////////////////////////////////////
-        if warp_idx == self.empty_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_empty)
+        if warp_idx == self.schedule.empty_warp_id:
+            cute.arch.warpgroup_reg_dealloc(self.schedule.num_regs_empty)
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  LOAD
         # ///////////////////////////////////////////////////////////////////////////////
-        if warp_idx == self.load_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
+        if warp_idx == self.schedule.load_warp_id:
+            cute.arch.warpgroup_reg_dealloc(self.schedule.num_regs_other)
             self.loader_role.run(
                 qk_thr_mma, pv_thr_mma,
                 tma_atom_q, tma_atom_k, tma_atom_v,
@@ -764,8 +491,8 @@ class BlackwellFusedMultiHeadAttentionForward:
         # ///////////////////////////////////////////////////////////////////////////////
         #  MMA
         # ///////////////////////////////////////////////////////////////////////////////
-        if warp_idx == self.mma_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
+        if warp_idx == self.schedule.mma_warp_id:
+            cute.arch.warpgroup_reg_dealloc(self.schedule.num_regs_other)
             self.mma_role.run(
                 qk_tiled_mma, pv_tiled_mma,
                 tStS0, tStS1, tOtO0, tOtO1,
@@ -781,8 +508,8 @@ class BlackwellFusedMultiHeadAttentionForward:
         # ///////////////////////////////////////////////////////////////////////////////
         #  Epilogue
         # ///////////////////////////////////////////////////////////////////////////////
-        if warp_idx == self.epilogue_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
+        if warp_idx == self.schedule.epilogue_warp_id:
+            cute.arch.warpgroup_reg_dealloc(self.schedule.num_regs_other)
             self.epilogue_role.run(
                 tma_atom_o, mO_qdl, sO,
                 cum_seqlen_q,
@@ -793,9 +520,9 @@ class BlackwellFusedMultiHeadAttentionForward:
         # ///////////////////////////////////////////////////////////////////////////////
         #  Softmax0
         # ///////////////////////////////////////////////////////////////////////////////
-        if warp_idx < self.softmax1_warp_ids[0]:
+        if warp_idx < self.schedule.softmax1_warp_ids[0]:
             # increase register after decreasing
-            cute.arch.warpgroup_reg_alloc(self.num_regs_softmax)
+            cute.arch.warpgroup_reg_alloc(self.schedule.num_regs_softmax)
 
             self.softmax_role.run(
                 stage=0,
@@ -819,11 +546,11 @@ class BlackwellFusedMultiHeadAttentionForward:
         #  Softmax1
         # ///////////////////////////////////////////////////////////////////////////////
         if (
-            warp_idx < self.correction_warp_ids[0]
-            and warp_idx >= self.softmax1_warp_ids[0]
+            warp_idx < self.schedule.correction_warp_ids[0]
+            and warp_idx >= self.schedule.softmax1_warp_ids[0]
         ):
             # increase register after decreasing
-            cute.arch.warpgroup_reg_alloc(self.num_regs_softmax)
+            cute.arch.warpgroup_reg_alloc(self.schedule.num_regs_softmax)
 
             self.softmax_role.run(
                 stage=1,
@@ -846,8 +573,8 @@ class BlackwellFusedMultiHeadAttentionForward:
         # ///////////////////////////////////////////////////////////////////////////////
         #  Correction
         # ///////////////////////////////////////////////////////////////////////////////
-        if warp_idx >= self.correction_warp_ids[0] and warp_idx < self.mma_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_correction)
+        if warp_idx >= self.schedule.correction_warp_ids[0] and warp_idx < self.schedule.mma_warp_id:
+            cute.arch.warpgroup_reg_dealloc(self.schedule.num_regs_correction)
             self.correction_role.run(
                 qk_thr_mma, pv_thr_mma,
                 tStS, tOtO0, tOtO1, sO,
