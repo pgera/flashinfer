@@ -8,11 +8,17 @@ and provides @cute.jit methods for the load warp.
 """
 
 from types import SimpleNamespace
+from typing import Optional
 
 import cutlass
 import cutlass.cute as cute
 import cutlass.cute.nvgpu.cpasync as cpasync
 import cutlass.pipeline as pipeline
+
+from ..scheduler.mla_persistent import (
+    MLAStaticTileSchedulerParams,
+    create_mla_static_tile_scheduler,
+)
 
 
 class MLALoaderRole:
@@ -22,8 +28,112 @@ class MLALoaderRole:
         self.iterations_pv_k = config.iterations_pv_k
         self.iterations_pv_n = config.iterations_pv_n
         self.use_page_table = config.use_page_table
+        self.is_var_split_kv = config.is_var_split_kv
         self.mma_qk_tiler = config.mma_qk_tiler
         self.mma_pv_tiler = config.mma_pv_tiler
+
+    @cute.jit
+    def run(
+        self,
+        tiled_mma_qk: cute.TiledMma,
+        tiled_mma_pv: cute.TiledMma,
+        tma_atom_q_latent: cute.CopyAtom,
+        mQL: cute.Tensor,
+        tma_atom_q_rope: cute.CopyAtom,
+        mQR: cute.Tensor,
+        tma_atom_c_latent: cute.CopyAtom,
+        mCL: cute.Tensor,
+        tma_atom_c_rope: cute.CopyAtom,
+        mKR: cute.Tensor,
+        tma_atom_c_latent_transpose: cute.CopyAtom,
+        mCLT: cute.Tensor,
+        sQ: cute.Tensor,
+        sKC: cute.Tensor,
+        sVC: cute.Tensor,
+        load_q_pipeline,
+        load_kv_pipeline,
+        load_q_stages: int,
+        load_kv_stages: int,
+        mPT: Optional[cute.Tensor],
+        tile_sched_params: MLAStaticTileSchedulerParams,
+        split_kv: cutlass.Int32,
+        cache_seqs: cute.Tensor,
+        block_split_kvs: Optional[cute.Tensor],
+    ):
+        """Loader warp orchestration loop for MLA decode.
+
+        Owns the tile scheduler loop, constructs per-tile params, and
+        delegates to load_tma() for each work tile.
+        """
+        load_q_producer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Producer, load_q_stages
+        )
+        load_kv_producer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Producer, load_kv_stages
+        )
+        tile_sched = create_mla_static_tile_scheduler(
+            tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
+        )
+        work_tile = tile_sched.initial_work_tile_info()
+        while work_tile.is_valid_tile:
+            blk_coord = work_tile.tile_idx
+            k_index, k_tile_count, local_split_kv = self._get_k_tile_count(
+                split_kv, cache_seqs, block_split_kvs, blk_coord,
+            )
+            if k_tile_count > 0:
+                tma_common_params = SimpleNamespace(
+                    blk_coord=blk_coord,
+                    local_split_kv=local_split_kv,
+                    load_q_pipeline=load_q_pipeline,
+                    load_kv_pipeline=load_kv_pipeline,
+                    mPT=mPT,
+                )
+                tma_qk_params = SimpleNamespace(
+                    tiled_mma_qk=tiled_mma_qk,
+                    tma_atom_q_latent=tma_atom_q_latent,
+                    tma_atom_q_rope=tma_atom_q_rope,
+                    tma_atom_c_latent=tma_atom_c_latent,
+                    tma_atom_c_rope=tma_atom_c_rope,
+                    mQL=mQL,
+                    mQR=mQR,
+                    mCL=mCL,
+                    mKR=mKR,
+                    sQ=sQ,
+                    sKC=sKC,
+                )
+                tma_pv_params = SimpleNamespace(
+                    tiled_mma_pv=tiled_mma_pv,
+                    tma_atom_c_latent_transpose=tma_atom_c_latent_transpose,
+                    mCL=mCL,
+                    mKR=mKR,
+                    mCLT=mCLT,
+                    sVC=sVC,
+                )
+                load_q_producer_state, load_kv_producer_state = self.load_tma(
+                    tma_common_params,
+                    tma_qk_params,
+                    tma_pv_params,
+                    k_index,
+                    k_tile_count,
+                    load_q_producer_state,
+                    load_kv_producer_state,
+                )
+            tile_sched.advance_to_next_work()
+            work_tile = tile_sched.get_current_work()
+
+        load_q_pipeline.producer_tail(load_q_producer_state)
+        load_kv_pipeline.producer_tail(load_kv_producer_state)
+
+    @cute.jit
+    def _get_k_tile_count(self, split_kv, cache_seqs, block_split_kvs, blk_coord):
+        K = cache_seqs[blk_coord[2]]
+        if cutlass.const_expr(self.is_var_split_kv):
+            split_kv = block_split_kvs[blk_coord[2]]
+        k_tile_total = cute.ceil_div(K, self.mma_qk_tiler[1])
+        k_tile_per_cta = cute.ceil_div(k_tile_total, split_kv)
+        k_index = blk_coord[3] * k_tile_per_cta
+        k_tile_count = max(0, min(k_tile_total, k_index + k_tile_per_cta) - k_index)
+        return k_index, k_tile_count, split_kv
 
     @cute.jit
     def load_tma(

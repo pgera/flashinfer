@@ -365,7 +365,7 @@ Prioritized by expected impact:
 
 ### Motivation
 
-`prefill.py` (2934 lines) and `mla.py` (3641 lines) were monolithic classes where warp roles, pipeline topology, TMEM layout, softmax algorithm, masking, and scheduling were intertwined. The modular `attention/` package breaks these into focused building blocks. After Phases 1–6, the kernel files have been reduced to 600 lines (FMHA) and 1073 lines (MLA) — pure kernel logic with no wrapper or utility code.
+`prefill.py` (2934 lines) and `mla.py` (3641 lines) were monolithic classes where warp roles, pipeline topology, TMEM layout, softmax algorithm, masking, and scheduling were intertwined. The modular `attention/` package breaks these into focused building blocks. After Phases 1–7, the kernel files have been reduced to 598 lines (FMHA) and 593 lines (MLA) — pure kernel logic with no wrapper or utility code. The two kernels are now near-identical in size, with each warp section expressed as a single-line dispatch to the corresponding role's `run()` method.
 
 ### Design Principle
 
@@ -375,10 +375,12 @@ Prioritized by expected impact:
 
 The building blocks handle the *how* (TMEM layout, pipeline synchronization, warp assignment). The kernel expresses the *what*.
 
-After completing Phases 1–6, the kernel files achieve this goal:
+**For a step-by-step guide on writing a new attention variant, see Section 10.**
 
-- **`prefill.py`** (600 lines, down from 1230): Pure kernel class with no config unpacking boilerplate, no infrastructure setup, and no wrapper/test code. The `__call__` method's warp dispatch reads as high-level role delegation. The `CollectiveBuilder` handles all MMA atom, SMEM layout, TMA atom, and `SharedStorage` creation. Helper methods `_create_pipelines()` and `_create_mma_fragments()` keep the kernel body concise.
-- **`mla_decode.py`** (1073 lines, down from 1554): Same treatment. The larger size reflects MLA's inherent complexity (split-KV, paged KV, reduction kernel, multiple MMA shapes for latent vs RoPE paths).
+After completing Phases 1–7, the kernel files achieve this goal:
+
+- **`prefill.py`** (598 lines, down from 1230): Pure kernel class with no config unpacking boilerplate, no infrastructure setup, and no wrapper/test code. The `__call__` method's warp dispatch reads as high-level role delegation. The `CollectiveBuilder` handles all MMA atom, SMEM layout, TMA atom, and `SharedStorage` creation. Helper methods `_create_pipelines()` and `_create_mma_fragments()` keep the kernel body concise.
+- **`mla_decode.py`** (593 lines, down from 1554): Same treatment and now nearly identical in size to FMHA. Tile scheduler loops and parameter bundling were moved from the kernel body into each role's `run()` method, making the three warp sections (Load, MMA, Compute) single-line dispatches — matching FMHA's pattern exactly. The remaining size beyond FMHA reflects MLA's inherent complexity (split-KV reduction kernel, cluster synchronization, TMEM lifecycle).
 
 Following the C++ CUTLASS collectives pattern, FMHA and MLA use **separate concrete types** (not abstract base classes) for variant-specific components (`AttentionConfig` vs `MLAConfig`, `WarpSchedule` vs `MLAWarpSchedule`), while sharing infrastructure (`PipelineTopology`, `softmax_math`, `tmem_utils`) via composition. The original monolithic files are preserved unchanged; the modular implementation is a parallel codebase in `flashinfer/cute_dsl/attention/`.
 
@@ -653,34 +655,40 @@ Three layers of boilerplate removal to make kernel bodies read like pseudocode:
 16. **Removed dead code from `prefill.py`** — Deleted `_Removed_BatchPrefillCuteDSLWrapper_PLACEHOLDER` and duplicate test utilities (`qkv_torch_2_cute`, `create_and_pad_tensor`), removing ~357 lines. The real wrapper lives in `wrappers/batch_prefill.py`.
 17. **Moved MLA utilities to `wrappers/batch_mla.py`** — Relocated `create_page_table`, `create_block_split_kvs`, `create_workspace`, `torch_to_cute`, `create_tensor`, `ceil_div` (~200 lines) from the kernel file to the wrapper, where they belong. The kernel files now contain only kernel logic.
 
-### Phase 7: Performance Enhancements -- PENDING
+### Phase 7: MLA Kernel Loop Extraction -- DONE
 
-18. **Skip-correction** — `vote_all_sync` to avoid rescaling when unnecessary
-19. **Softmax software pipelining** — interleave FMA, exp2, dtype conversion
-20. **Fused atomic reduction** for split-KV (eliminates reduction kernel)
-21. **FP8 support** in config, loader, and MMA modules
+18. **Moved tile scheduler loops into MLA roles** — Each MLA role (`MLALoaderRole`, `MLAMmaRole`, `MLAComputeRole`) gained a `run()` method that owns its tile scheduler loop, pipeline state creation, SimpleNamespace parameter bundling, and pipeline tail/barrier calls. The kernel's three warp sections became single-line `self.xxx_role.run(...)` dispatches, matching the FMHA pattern where each role owns its own loop. This reduced `mla_decode.py` from 1073 to 593 lines.
+19. **Added `_get_k_tile_count()` to each role** — The device-side tile range computation (`ceil_div` + index math) requires `@cute.jit` for CuTe DSL's `min`/`max` rewrites. Rather than a shared standalone function (which can't be `@cute.jit`), each role has its own `_get_k_tile_count()` method. A standalone `mla_get_k_tile_count()` utility was also added to `scheduler/mla_persistent.py` for host-side callers (wrappers).
+20. **Removed `get_k_tile_count` from kernel class** — No longer needed since each role has its own.
 
-### Phase 8: New Features -- PENDING
+### Phase 8: Performance Enhancements -- PENDING
 
-22. **Causal-aware tile scheduling** with swizzled launch order
-23. **ThreadShape configurability** for different Q/K aspect ratios
-24. **Backward pass** (requires new kernel composition)
-25. **Wire `AttentionFusion` into MLA** — extend customization hooks to MLA decode
+21. **Skip-correction** — `vote_all_sync` to avoid rescaling when unnecessary
+22. **Softmax software pipelining** — interleave FMA, exp2, dtype conversion
+23. **Fused atomic reduction** for split-KV (eliminates reduction kernel)
+24. **FP8 support** in config, loader, and MMA modules
+
+### Phase 9: New Features -- PENDING
+
+25. **Causal-aware tile scheduling** with swizzled launch order
+26. **ThreadShape configurability** for different Q/K aspect ratios
+27. **Backward pass** (requires new kernel composition)
+28. **Wire `AttentionFusion` into MLA** — extend customization hooks to MLA decode
 
 ---
 
 ## 9. Implementation Status
 
-This section tracks the current state of the modularization effort. The original monoliths (`prefill.py` at 2933 lines, `mla.py` at 3641 lines) remain untouched. A parallel modular implementation lives in `flashinfer/cute_dsl/attention/` (36 files, ~7600 lines total) and is verified by dedicated test suites.
+This section tracks the current state of the modularization effort. The original monoliths (`prefill.py` at 2933 lines, `mla.py` at 3641 lines) remain untouched. A parallel modular implementation lives in `flashinfer/cute_dsl/attention/` (36 files, ~7650 lines total) and is verified by dedicated test suites.
 
 ### Current File Layout
 
 ```
-flashinfer/cute_dsl/attention/          # 7607 lines total across 36 files
+flashinfer/cute_dsl/attention/          # 7650 lines total across 36 files
 │
 │  ── Kernels (top-level, readable dispatchers) ──
-├── prefill.py              (600 lines)   FMHA prefill kernel (pure kernel, no wrapper/test code)
-├── mla_decode.py          (1073 lines)   MLA decode kernel + reduction kernel (pure kernel)
+├── prefill.py              (598 lines)   FMHA prefill kernel (pure kernel, no wrapper/test code)
+├── mla_decode.py           (593 lines)   MLA decode kernel + reduction kernel (pure kernel)
 ├── collective_builder.py   (348 lines)   build_fmha/mla_launch_params: MMA atoms, SMEM, TMA, SharedStorage
 │
 │  ── Configuration ──
@@ -701,9 +709,9 @@ flashinfer/cute_dsl/attention/          # 7607 lines total across 36 files
 │   ├── epilogue.py         (163 lines)   EpilogueRole: TMA store output
 │
 │  ── MLA Roles ──
-│   ├── mla_loader.py       (312 lines)   MLALoaderRole: paged latent + RoPE loads
-│   ├── mla_mma.py          (266 lines)   MLAMmaRole: QK + PV with head packing
-│   ├── mla_compute.py      (106 lines)   MLAComputeRole: orchestrator
+│   ├── mla_loader.py       (422 lines)   MLALoaderRole: paged latent + RoPE loads, owns tile sched loop
+│   ├── mla_mma.py          (415 lines)   MLAMmaRole: QK + PV with head packing, owns TMEM + tile sched loop
+│   ├── mla_compute.py      (237 lines)   MLAComputeRole: orchestrator, owns tile sched loop
 │   ├── mla_softmax.py      (234 lines)   MLASoftmaxRole: online softmax
 │   ├── mla_rescale.py       (75 lines)   MLARescaleRole: O accumulator rescaling
 │   ├── mla_epilogue.py     (153 lines)   MLAEpilogueRole: final output write
@@ -722,12 +730,12 @@ flashinfer/cute_dsl/attention/          # 7607 lines total across 36 files
 │  ── Schedulers ──
 ├── scheduler/
 │   ├── persistent.py       (166 lines)   FmhaStaticTileScheduler
-│   └── mla_persistent.py   (200 lines)   MLAStaticTileScheduler
+│   └── mla_persistent.py   (245 lines)   MLAStaticTileScheduler + mla_get_k_tile_count, mla_get_split_kv
 │
 │  ── PyTorch Wrappers ──
 └── wrappers/
     ├── batch_prefill.py    (381 lines)   BatchPrefillCuteDSLWrapper + tensor utils
-    └── batch_mla.py        (621 lines)   BatchMLAPagedAttentionWrapperCuteDSL + tensor/page utils
+    └── batch_mla.py        (637 lines)   BatchMLAPagedAttentionWrapperCuteDSL + tensor/page utils
 ```
 
 ### Shared vs Variant-Specific Components
@@ -741,11 +749,12 @@ flashinfer/cute_dsl/attention/          # 7607 lines total across 36 files
 | **Softmax math** | `exp2_scale()` shared; `packed_row_sum()` available | `exp2_scale` only (hand-optimized 4-way unrolled row-sum for ILP) | Both `exp2_scale` and `packed_row_sum` |
 | **TMEM utilities** | `tmem_load_partition()` | — | Used by `MLARescaleRole`, `MLAEpilogueRole` |
 | **Masking** | `MaskType`, `apply_mask()`, trip count helpers | Used inline in `SoftmaxRole` | Boundary masking inline in `MLASoftmaxRole` |
-| **Loader** | — | `LoaderRole` (streaming Q/K/V) | `MLALoaderRole` (paged latent + RoPE) |
-| **MMA** | — | `MmaRole` (double-buffered QK/PV) | `MLAMmaRole` (staged, head-packed) |
+| **Loader** | — | `LoaderRole` (streaming Q/K/V) | `MLALoaderRole` (paged latent + RoPE; `run()` owns tile sched loop) |
+| **MMA** | — | `MmaRole` (double-buffered QK/PV) | `MLAMmaRole` (staged, head-packed; `run()` owns TMEM + tile sched loop) |
+| **Compute** | — | N/A (roles dispatched directly by kernel) | `MLAComputeRole` (orchestrator; `run()` owns tile sched loop, delegates to softmax/rescale/epilogue) |
 | **Correction / Rescale** | Packed-scale pattern (similar but not yet extracted) | `CorrectionRole` | `MLARescaleRole` |
 | **Epilogue** | — | `EpilogueRole` (TMA store) | `MLAEpilogueRole` (direct write) |
-| **Scheduler** | — | `FmhaStaticTileScheduler` | `MLAStaticTileScheduler` |
+| **Scheduler** | — | `FmhaStaticTileScheduler` | `MLAStaticTileScheduler`, `mla_get_k_tile_count` |
 | **Fusion hooks** | `AttentionFusion` (logits/output transforms, sinks) | Full support | Not yet wired |
 
 ### Comparison to C++ CUTLASS Collectives
@@ -755,7 +764,7 @@ flashinfer/cute_dsl/attention/          # 7607 lines total across 36 files
 | **Kernel template** | One shared kernel (`Sm100FmhaFwdKernelTmaWarpspecialized`) parameterized by mainloop type | Separate kernel files (`prefill.py`, `mla_decode.py`) — both are thin dispatchers |
 | **Mainloop** | `Sm100FmhaFwd*` / `Sm100FmhaMlaFwd*` concrete types defining pipelines + TMEM + roles | `MainloopSpec` / `MLAMainloopSpec` dataclasses with `PipelineTopology` + `TmemLayout` |
 | **Pipeline creation** | Types defined in mainloop, instantiated by kernel | Declarative `PipelineTopology` with `create_pipelines()` factory |
-| **Roles** | Methods on the mainloop (`load()`, `mma()`, `softmax()`, `correction()`) | Separate role classes composed by the kernel |
+| **Roles** | Methods on the mainloop (`load()`, `mma()`, `softmax()`, `correction()`) | Separate role classes composed by the kernel; MLA roles have `run()` methods owning their tile scheduler loops |
 | **Shared math** | Inline in each mainloop (no cross-variant sharing) | Extracted: `softmax_math.py`, `tmem_utils.py` |
 | **Config** | Template parameters + `Params` struct | `AttentionConfig` / `MLAConfig` dataclasses |
 | **CollectiveBuilder** | Selects MMA atoms, TMA descriptors, pipeline types from config | `collective_builder.py`: `build_fmha_launch_params()`, `build_mla_launch_params()` |
@@ -869,11 +878,285 @@ Listed roughly in order of impact:
 
 2. **Move role instantiation into MainloopSpec** — Currently the kernel `__init__` creates role instances. Moving this into the mainloop spec would make it closer to the C++ pattern where the mainloop *is* the collective. Medium risk.
 
-3. **Wire `AttentionFusion` into MLA** — The fusion hooks (logits transforms, output transforms, attention sinks) currently only work in FMHA. Extending to MLA would enable customizable MLA decode. Low-medium risk.
+3. **Add `run()` methods to FMHA roles** — The FMHA roles don't yet have `run()` methods like the MLA roles do. FMHA's warp sections in the kernel are already concise, but adding `run()` methods would improve symmetry across variants and further slim the kernel body. Low-medium risk.
 
-4. **Performance optimizations** — Skip-correction (`vote_all_sync` to avoid rescaling when unnecessary), softmax software pipelining, exp2 emulation, fused atomic reduction for split-KV. These are independent and can be added per-variant.
+4. **Wire `AttentionFusion` into MLA** — The fusion hooks (logits transforms, output transforms, attention sinks) currently only work in FMHA. Extending to MLA would enable customizable MLA decode. Low-medium risk.
 
-5. **Unify kernel dispatcher** — The C++ code uses one kernel template for both FMHA and MLA. Currently we have two separate kernel files. Unifying would require abstracting the warp dispatch, which is the most variant-specific part. High risk, potentially not worth it given Python's JIT advantage.
+5. **Performance optimizations** — Skip-correction (`vote_all_sync` to avoid rescaling when unnecessary), softmax software pipelining, exp2 emulation, fused atomic reduction for split-KV. These are independent and can be added per-variant.
+
+6. **Unify kernel dispatcher** — The C++ code uses one kernel template for both FMHA and MLA. Currently we have two separate kernel files. Unifying would require abstracting the warp dispatch, which is the most variant-specific part. High risk, potentially not worth it given Python's JIT advantage.
+
+---
+
+## 10. Writing a New Attention Variant
+
+This section explains how to add a new attention kernel variant to the modular `flashinfer/cute_dsl/attention/` package. Both the FMHA prefill and MLA decode kernels follow this pattern.
+
+### Three-Layer Architecture
+
+The attention package has three layers with strict responsibilities:
+
+```
+Layer 1: Wrappers (wrappers/)
+  PyTorch API: plan()/run(), torch-to-CuTe conversion, workspace, validation
+
+Layer 2: Kernels (prefill.py, mla_decode.py)
+  Algorithm: __init__ -> __call__ -> kernel, CuTe tensors in/out
+
+Layer 3: Building Blocks (roles/, config, scheduler/, fusion/, collective_builder, pipelines)
+  Reusable components composed by kernels
+```
+
+**Wrappers own**: tensor conversion, workspace sizing/allocation, `can_implement` validation, scheduling heuristics (e.g. `get_split_kv`), page table creation.
+
+**Kernels own**: the algorithm (device code), warp dispatch, pipeline creation, device-side tile range computation.
+
+**Building blocks own**: MMA/TMA/SMEM setup, warp-level role logic, tile scheduling, masking, config dataclasses.
+
+### Step-by-Step Recipe
+
+#### Step 1: Define Your Config
+
+Create a dataclass in `config.py` (or `xxx_config.py` for a new file) that describes the problem shape, data types, tile sizes, and feature flags.
+
+```python
+@dataclass(frozen=True)
+class XxxConfig:
+    head_dim: int
+    num_heads: int
+    acc_dtype: Type[cutlass.Numeric] = cutlass.Float32
+    mma_tiler_mn: Tuple[int, int] = (128, 128)
+    is_persistent: bool = True
+
+    @property
+    def mma_tiler(self) -> Tuple[int, int, int]:
+        return (*self.mma_tiler_mn, self.head_dim)
+```
+
+**Reference**: `config.py` (AttentionConfig), `mla_config.py` (MLAConfig).
+
+#### Step 2: Define Your Warp Schedule
+
+Create a dataclass with warp role assignments and register budgets.
+
+```python
+@dataclass(frozen=True)
+class XxxWarpSchedule:
+    load_warp_id: int
+    mma_warp_id: int
+    compute_warp_ids: Tuple[int, ...]
+    threads_per_warp: int = 32
+
+XXX_SCHEDULE = XxxWarpSchedule(load_warp_id=5, mma_warp_id=4, ...)
+```
+
+**Reference**: `warp_schedule.py`, `mla_warp_schedule.py`.
+
+#### Step 3: Implement Your Roles
+
+Each warp role is a class in `roles/` with `@cute.jit` methods. Roles receive params and implement one warp's work.
+
+```python
+class XxxLoaderRole:
+    def __init__(self, config: XxxConfig):
+        self.config = config
+
+    @cute.jit
+    def run(self, params, pipeline_states, ...):
+        ...
+```
+
+Common roles: Loader (TMA loads), MMA (matrix multiplies), Softmax (online softmax), Correction/Rescale (accumulator rescaling), Epilogue (output writes).
+
+**Shared utilities**: `roles/softmax_math.py` (`exp2_scale`, `packed_row_sum`), `roles/tmem_utils.py` (`tmem_load_partition`).
+
+#### Step 4: Define MainloopSpec and Pipeline Topology
+
+Bundle your config, schedule, and pipeline topology into a mainloop spec.
+
+```python
+@dataclass
+class XxxMainloopSpec:
+    config: XxxConfig
+    schedule: XxxWarpSchedule
+    topology: PipelineTopology
+    kv_stages: int = 0
+
+    def resolve(self, dtype_width):
+        ...
+```
+
+Define your pipeline topology using `PipelineEdge` specs:
+
+```python
+def make_xxx_topology(schedule):
+    return PipelineTopology([
+        PipelineEdge("load_q", PipelineType.TMA_UMMA, ...),
+        PipelineEdge("load_kv", PipelineType.TMA_UMMA, ...),
+    ])
+```
+
+**Reference**: `mainloop_spec.py`, `pipeline_topology.py`.
+
+#### Step 5: Add a CollectiveBuilder Function
+
+Add a `build_xxx_launch_params()` function in `collective_builder.py`. This creates MMA atoms, SMEM layouts, TMA atoms, and the `SharedStorage` struct.
+
+```python
+def build_xxx_launch_params(mainloop, *tensors, *dtypes):
+    qk_tiled_mma = sm100_utils.make_trivial_tiled_mma(...)
+    q_smem_layout = sm100_utils.make_smem_layout_a(...)
+    tma_atom_q = sm100_utils.make_tiled_tma_atom_A(...)
+    # Define SharedStorage struct
+    return SimpleNamespace(qk_tiled_mma=..., SharedStorage=..., ...)
+```
+
+**Reference**: `collective_builder.py` — `build_fmha_launch_params` and `build_mla_launch_params`.
+
+#### Step 6: Write the Kernel
+
+This is the top-level file. Follow this exact method structure:
+
+```python
+class BlackwellXxxAttention:
+    def __init__(self, config: XxxConfig, schedule: XxxWarpSchedule = None):
+        """Store config + schedule, create mainloop spec. Lightweight."""
+        self.config = config
+        self.schedule = schedule or XXX_SCHEDULE
+        self.mainloop = make_xxx_mainloop_spec(config, self.schedule)
+
+    @cute.jit
+    def __call__(self, *tensors, stream):
+        """Validate, resolve, create roles, build launch params, launch."""
+        self.q_dtype = q.element_type
+        ...
+        self.mainloop.resolve(self.q_dtype.width)
+
+        # Create roles after resolve
+        self.loader_role = XxxLoaderRole(self.config)
+        self.mma_role = XxxMmaRole(self.config, self.mainloop)
+        ...
+
+        lp = build_xxx_launch_params(self.mainloop, ...)
+        tile_sched_params, grid = self._compute_grid(...)
+        self.kernel(...).launch(grid=grid, block=..., stream=stream)
+
+    @cute.jit
+    def _create_pipelines(self, storage):
+        """Build pipelines from topology and barrier pointers."""
+        return self.mainloop.topology.create_pipelines(storage, ...)
+
+    @cute.jit
+    def kernel(self, ...launch_params):
+        """Device kernel: shared storage + pipelines + warp dispatch."""
+        smem = utils.SmemAllocator()
+        storage = smem.allocate(SharedStorage)
+        pipelines = self._create_pipelines(storage)
+
+        warp_idx = cute.arch.warp_idx()
+        if warp_idx == self.schedule.load_warp_id:
+            self.loader_role.run(...)
+        elif warp_idx == self.schedule.mma_warp_id:
+            self.mma_role.run(...)
+        elif warp_idx >= ...:
+            self.compute_role.run(...)
+
+    @staticmethod
+    def _compute_grid(...):
+        ...
+```
+
+#### Canonical Method Table
+
+| Method | Required | Purpose |
+|--------|----------|---------|
+| `__init__(config, schedule)` | Yes | Store config + schedule, create mainloop. Lightweight. |
+| `__call__(*tensors, stream)` | Yes | Validate, resolve, create roles, build params, launch. |
+| `_create_pipelines(storage)` | Yes | Build pipelines from topology. |
+| `kernel(...)` | Yes | Shared storage + pipelines + warp dispatch. |
+| `_compute_grid(...)` | Yes | Static method for grid shape. |
+| `reduction_kernel(...)` | Optional | For split-KV variants only. |
+| `_create_mma_fragments(...)` | Optional | If multiple roles share TMEM fragments. |
+
+#### Key Rules
+
+1. **`__init__` is declarative**: only stores config, schedule, and creates mainloop spec. No role creation.
+2. **Roles are created in `__call__`**: after `mainloop.resolve()` sets stage counts.
+3. **The kernel method is always called `kernel`**: even for split-KV variants.
+4. **Each role owns its loop**: roles have `run()` methods containing the tile scheduler loop, pipeline state management, and parameter bundling. The kernel body is a clean warp dispatch with single-line `role.run()` calls.
+5. **Device-side tile range computation** (`_get_k_tile_count`) lives as a `@cute.jit` method on each role (not on the kernel class), because CuTe DSL's symbolic `min`/`max` rewrites require `@cute.jit` context.
+6. **MMA fragments**: if multiple roles share TMEM fragment views, create them in `_create_mma_fragments` and pass to roles. If roles are self-contained, let them create their own.
+
+#### Step 7: Write the Wrapper
+
+Create a PyTorch-facing API in `wrappers/batch_xxx.py` that handles tensor conversion and provides `plan()`/`run()`.
+
+```python
+class BatchXxxWrapper:
+    def __init__(self, workspace_buffer, ...):
+        ...
+
+    def plan(self, *user_params):
+        config = XxxConfig(...)
+        kernel = BlackwellXxxAttention(config)
+        self._compiled = cute.compile(kernel, ...)
+
+    def run(self, q, k, v, o, ...):
+        self._compiled(q_cute, k_cute, ..., stream)
+```
+
+The wrapper owns:
+- `can_implement` validation (from `xxx_config.py`)
+- Scheduling heuristics (from `scheduler/xxx_persistent.py`)
+- Workspace allocation
+- Page table creation (if applicable)
+- Torch tensor to CuTe tensor conversion
+
+**Reference**: `wrappers/batch_prefill.py`, `wrappers/batch_mla.py`.
+
+#### Step 8: Write Tests
+
+Add tests in `tests/test_blackwell_xxx_attention.py`.
+
+```python
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("batch_size", [1, 4])
+def test_xxx_attention(dtype, batch_size, ...):
+    if not is_sm100a_supported():
+        pytest.skip("Requires SM100a")
+    wrapper = BatchXxxWrapper(...)
+    wrapper.plan(...)
+    wrapper.run(q, k, v, o)
+    torch.testing.assert_close(o, ref_output, atol=1e-3, rtol=1e-3)
+```
+
+#### Step 9: Register Exports
+
+Update `attention/__init__.py` to export your new kernel and config. Update `wrappers/__init__.py` to export the wrapper.
+
+### File Size Guidelines
+
+| Component | Typical Size | Notes |
+|-----------|-------------|-------|
+| Config dataclass | 50–150 lines | Problem shape, derived properties |
+| Warp schedule | 50–90 lines | Role assignments, barrier IDs |
+| Each role | 75–530 lines | Depends on algorithm complexity |
+| MainloopSpec addition | 20–50 lines | Added to existing file |
+| CollectiveBuilder function | 100–180 lines | Added to existing file |
+| **Kernel file** | **550–650 lines** | Pure algorithm, no utilities |
+| Wrapper | 300–650 lines | PyTorch API + tensor utils |
+| Tile scheduler | 100–250 lines | Grid/work distribution |
+
+### Existing Implementations
+
+| Variant | Kernel | Config | Roles | Total |
+|---------|--------|--------|-------|-------|
+| FMHA Prefill | `prefill.py` (598) | `config.py` (134) | softmax (530), correction (458), mma (258), loader (316), epilogue (163) | ~2600 |
+| MLA Decode | `mla_decode.py` (593) | `mla_config.py` (74) | mla_loader (422), mla_mma (415), mla_compute (237), mla_softmax (234), mla_rescale (75), mla_epilogue (153) | ~2850 |
+
+Both kernels share: `collective_builder.py` (348), `pipeline_topology.py` (315), `mainloop_spec.py` (173), `roles/softmax_math.py` (40), `roles/tmem_utils.py` (101).
+
+MLA roles have `run()` methods that own their tile scheduler loops, so the kernel body is a clean warp dispatch with single-line `role.run()` calls.
 
 ---
 
@@ -947,4 +1230,5 @@ This modularization was derived from the monolithic `prefill.py` (2934 lines) an
 - **MLA**: Ported from `mla.py` following the same extraction pattern, with separate concrete types (`MLAConfig`, `MLAWarpSchedule`, `MLAMainloopSpec`)
 - **`collective_builder.py`**: Created in Phase 5/Layer 2; encapsulates MMA atom, SMEM layout, TMA atom, and `SharedStorage` creation that was previously ~200–300 lines inline in each kernel's `__call__`
 - **Kernel readability (Phase 5)**: Removed config unpacking boilerplate (Layer 1), extracted infrastructure to CollectiveBuilder (Layer 2), extracted pipeline/MMA setup to `@cute.jit` helpers (Layer 3)
-- **Wrapper/utility cleanup (Phase 6)**: Moved test utilities and tensor conversion functions out of kernel files into `wrappers/`, reducing `prefill.py` from 957→600 lines and `mla_decode.py` from 1274→1073 lines
+- **Wrapper/utility cleanup (Phase 6)**: Moved test utilities and tensor conversion functions out of kernel files into `wrappers/`, reducing `prefill.py` from 957→598 lines and `mla_decode.py` from 1274→1073 lines
+- **MLA kernel loop extraction (Phase 7)**: Moved tile scheduler loops, `SimpleNamespace` parameter bundling, and pipeline state management from `mla_decode.py`'s `kernel()` into each MLA role's `run()` method, reducing `mla_decode.py` from 1073→593 lines and bringing it to near-parity with `prefill.py` (598 lines). Each role now owns a `_get_k_tile_count()` `@cute.jit` method for device-side tile range computation (required because CuTe DSL's `min`/`max` rewrites only work within `@cute.jit` context).

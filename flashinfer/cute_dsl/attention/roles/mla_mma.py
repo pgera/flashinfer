@@ -8,11 +8,17 @@ methods for Q*K^T and P*V computation.
 """
 
 from types import SimpleNamespace
+from typing import Optional
 
 import cutlass
 import cutlass.cute as cute
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.pipeline as pipeline
+
+from ..scheduler.mla_persistent import (
+    MLAStaticTileSchedulerParams,
+    create_mla_static_tile_scheduler,
+)
 
 
 class MLAMmaRole:
@@ -23,9 +29,152 @@ class MLAMmaRole:
         self.iterations_pv_k = config.iterations_pv_k
         self.iterations_pv_n = config.iterations_pv_n
         self.warps_in_n = config.warps_in_n
+        self.use_2cta_instrs = config.use_2cta_instrs
+        self.acc_dtype = config.acc_dtype
+        self.is_var_split_kv = config.is_var_split_kv
         self.mma_s_stage = mainloop.mma_s_stages
         self.mma_o_stage = mainloop.mma_o_stages
         self.tmem_o_offset = mainloop.tmem_o_offset
+        self.load_q_stages = mainloop.load_q_stages
+        self.load_kv_stages = mainloop.load_kv_stages
+        self.mma_s_stages = mainloop.mma_s_stages
+        self.p_mma_stages = mainloop.p_mma_stages
+        self.mma_o_stages = mainloop.mma_o_stages
+
+    @cute.jit
+    def _get_k_tile_count(self, split_kv, cache_seqs, block_split_kvs, blk_coord):
+        K = cache_seqs[blk_coord[2]]
+        if cutlass.const_expr(self.is_var_split_kv):
+            split_kv = block_split_kvs[blk_coord[2]]
+        k_tile_total = cute.ceil_div(K, self.mma_qk_tiler[1])
+        k_tile_per_cta = cute.ceil_div(k_tile_total, split_kv)
+        k_index = blk_coord[3] * k_tile_per_cta
+        k_tile_count = max(0, min(k_tile_total, k_index + k_tile_per_cta) - k_index)
+        return k_index, k_tile_count, split_kv
+
+    @cute.jit
+    def run(
+        self,
+        tiled_mma_qk: cute.TiledMma,
+        tiled_mma_pv: cute.TiledMma,
+        sQ: cute.Tensor,
+        sKC: cute.Tensor,
+        sP: cute.Tensor,
+        sVC: cute.Tensor,
+        load_q_pipeline,
+        load_kv_pipeline,
+        mma_s_pipeline,
+        p_mma_pipeline,
+        mma_o_pipeline,
+        tmem_holding_buf,
+        tmem_dealloc_mbar_ptr,
+        tmem_ptr_sync_bar,
+        L: cutlass.Int32,
+        is_leader_cta,
+        tile_sched_params: MLAStaticTileSchedulerParams,
+        split_kv: cutlass.Int32,
+        cache_seqs: cute.Tensor,
+        block_split_kvs: Optional[cute.Tensor],
+    ):
+        """MMA warp orchestration loop for MLA decode.
+
+        Manages TMEM allocation/deallocation, tile scheduler loop,
+        and delegates to mma() for each work tile.
+        """
+        cute.arch.alloc_tmem(
+            cute.arch.SM100_TMEM_CAPACITY_COLUMNS,
+            tmem_holding_buf,
+            is_two_cta=self.use_2cta_instrs,
+        )
+
+        tmem_ptr_sync_bar.arrive()
+
+        tmem_ptr = cute.arch.retrieve_tmem_ptr(
+            self.acc_dtype,
+            alignment=16,
+            ptr_to_buffer_holding_addr=tmem_holding_buf,
+        )
+
+        load_q_consumer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Consumer, self.load_q_stages
+        )
+        load_kv_consumer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Consumer, self.load_kv_stages
+        )
+        mma_s_producer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Producer, self.mma_s_stages
+        )
+        p_mma_consumer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Consumer, self.p_mma_stages
+        )
+        mma_o_producer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Producer, self.mma_o_stages
+        )
+        tile_sched = create_mla_static_tile_scheduler(
+            tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
+        )
+        work_tile = tile_sched.initial_work_tile_info()
+        while work_tile.is_valid_tile:
+            blk_coord = work_tile.tile_idx
+            k_index, k_tile_count, local_split_kv = self._get_k_tile_count(
+                split_kv, cache_seqs, block_split_kvs, blk_coord,
+            )
+            if k_tile_count > 0:
+                mma_common_params = SimpleNamespace(
+                    blk_coord=blk_coord,
+                    local_split_kv=local_split_kv,
+                    load_q_pipeline=load_q_pipeline,
+                    load_kv_pipeline=load_kv_pipeline,
+                    tmem_ptr=tmem_ptr,
+                    is_leader_cta=is_leader_cta,
+                    L=L,
+                )
+                mma_qk_params = SimpleNamespace(
+                    mma_s_pipeline=mma_s_pipeline,
+                    sQ=sQ,
+                    sKC=sKC,
+                )
+                mma_pv_params = SimpleNamespace(
+                    p_mma_pipeline=p_mma_pipeline,
+                    mma_o_pipeline=mma_o_pipeline,
+                    sP=sP,
+                    sVC=sVC,
+                )
+                (
+                    tiled_mma_qk,
+                    tiled_mma_pv,
+                    load_q_consumer_state,
+                    load_kv_consumer_state,
+                    mma_s_producer_state,
+                    p_mma_consumer_state,
+                    mma_o_producer_state,
+                ) = self.mma(
+                    mma_common_params,
+                    mma_qk_params,
+                    mma_pv_params,
+                    k_tile_count,
+                    tiled_mma_qk,
+                    tiled_mma_pv,
+                    load_q_consumer_state,
+                    load_kv_consumer_state,
+                    mma_s_producer_state,
+                    p_mma_consumer_state,
+                    mma_o_producer_state,
+                )
+            tile_sched.advance_to_next_work()
+            work_tile = tile_sched.get_current_work()
+
+        mma_s_pipeline.producer_tail(mma_s_producer_state)
+        mma_o_pipeline.producer_tail(mma_o_producer_state)
+
+        cute.arch.relinquish_tmem_alloc_permit(is_two_cta=self.use_2cta_instrs)
+        cute.arch.mbarrier_wait(tmem_dealloc_mbar_ptr, 0)
+
+        cute.arch.dealloc_tmem(
+            tmem_ptr,
+            cute.arch.SM100_TMEM_CAPACITY_COLUMNS,
+            is_two_cta=self.use_2cta_instrs,
+        )
 
     @cute.jit
     def mma(

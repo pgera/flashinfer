@@ -11,7 +11,7 @@ one level below in subdirectories.
 # Kernels
 from .prefill import BlackwellFusedMultiHeadAttentionForward
 from .mla_decode import BlackwellMultiLatentAttentionForward
-from .mla_config import MLAConfig
+from .mla_config import MLAConfig, mla_can_implement
 from .mla_warp_schedule import MLAWarpSchedule, MLA_DECODE_SCHEDULE
 
 # Building blocks

@@ -28,9 +28,7 @@
 
 
 import math
-from typing import Type, Tuple, Optional, Union, overload, Literal
-from types import SimpleNamespace
-
+from typing import Tuple, Optional
 import torch
 import cuda.bindings.driver as cuda
 
@@ -51,7 +49,6 @@ from .roles.mla_compute import MLAComputeRole
 from .scheduler.mla_persistent import (
     MLAStaticTileScheduler,
     MLAStaticTileSchedulerParams,
-    create_mla_static_tile_scheduler,
     create_mla_static_tile_scheduler_params,
 )
 
@@ -63,84 +60,21 @@ warnings.filterwarnings("ignore", category=UserWarning)
 LOG2_E = 1.4426950408889634074
 
 
-def ceil_div(a: int, b: int) -> int:
-    return (a + b - 1) // b
-
-
 class BlackwellMultiLatentAttentionForward:
     def __init__(
         self,
-        latent_dim: int,
-        rope_dim: int,
-        num_heads: int,
-        acc_dtype: Type[cutlass.Numeric],
-        lse_dtype: Type[cutlass.Numeric],
-        mma_qk_tiler_mn: Tuple[int, int],
-        mma_pv_tiler_mn: Tuple[int, int],
-        max_active_clusters: int,
-        is_persistent: bool,
-        is_cpasync: bool,
-        use_page_table: bool,
-        is_var_seq: bool,
-        is_var_split_kv: bool,
-        use_2cta_instrs: bool,
-        cluster_shape_mnk: Tuple[int, int, int],
-        *,
-        config: Optional[MLAConfig] = None,
+        config: MLAConfig,
         warp_schedule: Optional[MLAWarpSchedule] = None,
     ):
-        if config is None:
-            config = MLAConfig(
-                latent_dim=latent_dim,
-                rope_dim=rope_dim,
-                num_heads=num_heads,
-                acc_dtype=acc_dtype,
-                lse_dtype=lse_dtype,
-                mma_qk_tiler_mn=mma_qk_tiler_mn,
-                mma_pv_tiler_mn=mma_pv_tiler_mn,
-                max_active_clusters=max_active_clusters,
-                is_persistent=is_persistent,
-                is_cpasync=is_cpasync,
-                use_page_table=use_page_table,
-                is_var_seq=is_var_seq,
-                is_var_split_kv=is_var_split_kv,
-                use_2cta_instrs=use_2cta_instrs,
-                cluster_shape_mnk=cluster_shape_mnk,
-            )
+        """Initializes a Blackwell Multi-Latent Attention (MLA) decode kernel.
+
+        :param config: MLA configuration (dims, dtypes, tile shapes, mode).
+        :param warp_schedule: Warp role assignment and register budgets. Defaults to MLA_DECODE_SCHEDULE.
+        """
 
         self.config = config
         self.schedule = warp_schedule if warp_schedule is not None else MLA_DECODE_SCHEDULE
         self.mainloop = make_mla_mainloop_spec(config, self.schedule)
-        self.loader_role = MLALoaderRole(config)
-        self.mma_role = None  # initialized after mainloop.resolve() sets stage counts
-        self.compute_role = None  # initialized after mainloop.resolve() and dtypes known
-
-        self.tmem_ptr_sync_bar = pipeline.NamedBarrier(
-            barrier_id=self.schedule.tmem_ptr_sync_bar_id,
-            num_threads=self.schedule.tmem_ptr_sync_num_threads,
-        )
-        self.exchange_sync_bar = pipeline.NamedBarrier(
-            barrier_id=self.schedule.exchange_sync_bar_id,
-            num_threads=self.schedule.exchange_sync_num_threads,
-        )
-
-    def _setup_attributes(self):
-        """Set up configurations and parameters for the MLA kernel operation.
-
-        This method initializes and configures various attributes required for the
-        execution of the multi-head latent attention kernel, mainly about the pipeline stages:
-
-        - Sets up staging parameters for Q, K, V inputs and accumulator data
-        - Configures pipeline stages for softmax, correction, and epilogue operations
-        """
-
-        self.mainloop.resolve(self.k_dtype.width)
-        self.mma_role = MLAMmaRole(self.config, self.mainloop)
-        self.compute_role = MLAComputeRole(
-            self.config, self.mainloop, self.schedule, self.exchange_sync_bar
-        )
-        self.compute_role.q_dtype = self.q_dtype
-        self.compute_role.o_dtype = self.o_dtype
 
     @cute.jit
     def __call__(
@@ -225,21 +159,52 @@ class BlackwellMultiLatentAttentionForward:
         if cutlass.const_expr(lse.stride[0] != 1):
             raise ValueError("lse must have leading dimension 0")
 
-        acc_o, acc_lse = self.initialize_workspace(
-            q_latent.shape[0],
-            q_latent.shape[1],
-            q_latent.shape[2],
-            split_kv,
-            self.config.acc_dtype,
-            workspace,
-        )
+        acc_o, acc_lse = None, None
+        if cutlass.const_expr(workspace is not None):
+            H, D, B = q_latent.shape[0], q_latent.shape[1], q_latent.shape[2]
+            align = 128 // self.q_dtype.width
+            acc_o_layout = cute.make_layout(
+                (H, split_kv, D, B),
+                stride=(
+                    cute.assume(split_kv * D, align),
+                    cute.assume(D, align),
+                    1,
+                    cute.assume(H * split_kv * D, align),
+                ),
+            )
+            acc_o_iter = cute.recast_ptr(workspace.iterator, dtype=self.config.acc_dtype)
+            acc_o = cute.make_tensor(acc_o_iter, acc_o_layout)
+            acc_lse_layout = cute.make_layout(
+                (H, split_kv, B), stride=(split_kv, 1, H * split_kv)
+            )
+            acc_lse_iter = cute.recast_ptr(
+                workspace.iterator + cute.cosize(acc_o_layout) * self.config.acc_dtype.width // 8,
+                dtype=self.config.acc_dtype,
+            )
+            acc_lse = cute.make_tensor(acc_lse_iter, acc_lse_layout)
 
         c_latent_tranpose_layout = cute.select(c_latent.layout, mode=[1, 0, 2])
         c_latent_transpose = cute.make_tensor(
             c_latent.iterator, c_latent_tranpose_layout
         )
 
-        self._setup_attributes()
+        self.mainloop.resolve(self.k_dtype.width)
+
+        self.loader_role = MLALoaderRole(self.config)
+        self.mma_role = MLAMmaRole(self.config, self.mainloop)
+        self.exchange_sync_bar = pipeline.NamedBarrier(
+            barrier_id=self.schedule.exchange_sync_bar_id,
+            num_threads=self.schedule.exchange_sync_num_threads,
+        )
+        self.compute_role = MLAComputeRole(
+            self.config, self.mainloop, self.schedule, self.exchange_sync_bar
+        )
+        self.compute_role.q_dtype = self.q_dtype
+        self.compute_role.o_dtype = self.o_dtype
+        self.tmem_ptr_sync_bar = pipeline.NamedBarrier(
+            barrier_id=self.schedule.tmem_ptr_sync_bar_id,
+            num_threads=self.schedule.tmem_ptr_sync_num_threads,
+        )
 
         lp = build_mla_launch_params(
             self.mainloop, self.schedule,
@@ -257,7 +222,7 @@ class BlackwellMultiLatentAttentionForward:
         )
 
         softmax_scale_log2 = softmax_scale * LOG2_E
-        self.split_kv_kernel(
+        self.kernel(
             lp.qk_tiled_mma,
             lp.pv_tiled_mma,
             lp.tma_atom_q_latent,
@@ -328,7 +293,7 @@ class BlackwellMultiLatentAttentionForward:
         )
 
     @cute.kernel
-    def split_kv_kernel(
+    def kernel(
         self,
         tiled_mma_qk: cute.TiledMma,
         tiled_mma_pv: cute.TiledMma,
@@ -424,186 +389,41 @@ class BlackwellMultiLatentAttentionForward:
             cute.arch.barrier()
 
         # ///////////////////////////////////////////////////////////////////////////////
-        #  Load warps, including page table and data tensors
+        #  Load warps
         # ///////////////////////////////////////////////////////////////////////////////
         if cutlass.const_expr(self.config.is_cpasync):
             # TODO: add cp async load variant.
-            #  Load page table when isasync is true
-            # if warp_idx == self.schedule.load_pt_warp_id:
-            #     self.load_page_table()
-            # if (
-            #     warp_idx == self.load_cpasync_warp_id[0]
-            #     and warp_idx == self.load_cpasync_warp_id[1]
-            # ):
-            #     load_cpasync()
             pass
         else:
             if warp_idx == self.schedule.load_tma_warp_id:
-                load_q_producer_state = pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Producer, self.mainloop.load_q_stages
+                self.loader_role.run(
+                    tiled_mma_qk, tiled_mma_pv,
+                    tma_atom_q_latent, mQL,
+                    tma_atom_q_rope, mQR,
+                    tma_atom_c_latent, mCL,
+                    tma_atom_c_rope, mKR,
+                    tma_atom_c_latent_transpose, mCLT,
+                    sQ, sKC, sVC,
+                    load_q_pipeline, load_kv_pipeline,
+                    self.mainloop.load_q_stages, self.mainloop.load_kv_stages,
+                    mPT, tile_sched_params,
+                    split_kv, cache_seqs, block_split_kvs,
                 )
-                load_kv_producer_state = pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Producer, self.mainloop.load_kv_stages
-                )
-                tile_sched = create_mla_static_tile_scheduler(
-                    tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
-                )
-                work_tile = tile_sched.initial_work_tile_info()
-                while work_tile.is_valid_tile:
-                    blk_coord = work_tile.tile_idx
-                    k_index, k_tile_count, local_split_kv = self.get_k_tile_count(
-                        split_kv,
-                        cache_seqs,
-                        block_split_kvs,
-                        blk_coord,
-                    )
-                    if k_tile_count > 0:
-                        # Construct fixed common/tma_qk/tma_pv params for load_tma
-                        tma_common_params = SimpleNamespace(
-                            blk_coord=blk_coord,
-                            local_split_kv=local_split_kv,
-                            load_q_pipeline=load_q_pipeline,
-                            load_kv_pipeline=load_kv_pipeline,
-                            mPT=mPT,
-                        )
-                        tma_qk_params = SimpleNamespace(
-                            tiled_mma_qk=tiled_mma_qk,
-                            tma_atom_q_latent=tma_atom_q_latent,
-                            tma_atom_q_rope=tma_atom_q_rope,
-                            tma_atom_c_latent=tma_atom_c_latent,
-                            tma_atom_c_rope=tma_atom_c_rope,
-                            mQL=mQL,
-                            mQR=mQR,
-                            mCL=mCL,
-                            mKR=mKR,
-                            sQ=sQ,
-                            sKC=sKC,
-                        )
-                        tma_pv_params = SimpleNamespace(
-                            tiled_mma_pv=tiled_mma_pv,
-                            tma_atom_c_latent_transpose=tma_atom_c_latent_transpose,
-                            mCL=mCL,
-                            mKR=mKR,
-                            mCLT=mCLT,
-                            sVC=sVC,
-                        )
-                        # Load tma
-                        load_q_producer_state, load_kv_producer_state = self.loader_role.load_tma(
-                            tma_common_params,
-                            tma_qk_params,
-                            tma_pv_params,
-                            k_index,
-                            k_tile_count,
-                            load_q_producer_state,
-                            load_kv_producer_state,
-                        )
-                    tile_sched.advance_to_next_work()
-                    work_tile = tile_sched.get_current_work()
-
-                load_q_pipeline.producer_tail(load_q_producer_state)
-                load_kv_pipeline.producer_tail(load_kv_producer_state)
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  MMA warp
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx == self.schedule.mma_warp_id:
-            # Alloc tensor memory buffer
-            cute.arch.alloc_tmem(
-                cute.arch.SM100_TMEM_CAPACITY_COLUMNS,
-                tmem_holding_buf,
-                is_two_cta=self.config.use_2cta_instrs,
-            )
-
-            # sync with compute warp before tmem ptr is retrieved
-            self.tmem_ptr_sync_bar.arrive()
-
-            # Retrieving tensor memory ptr and make accumulator tensor
-            tmem_ptr = cute.arch.retrieve_tmem_ptr(
-                self.config.acc_dtype,
-                alignment=16,
-                ptr_to_buffer_holding_addr=tmem_holding_buf,
-            )
-
-            load_q_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.mainloop.load_q_stages
-            )
-            load_kv_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.mainloop.load_kv_stages
-            )
-            mma_s_producer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, self.mainloop.mma_s_stages
-            )
-            p_mma_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.mainloop.p_mma_stages
-            )
-            mma_o_producer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, self.mainloop.mma_o_stages
-            )
-            tile_sched = create_mla_static_tile_scheduler(
-                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
-            )
-            work_tile = tile_sched.initial_work_tile_info()
-            while work_tile.is_valid_tile:
-                blk_coord = work_tile.tile_idx
-                k_index, k_tile_count, local_split_kv = self.get_k_tile_count(
-                    split_kv, cache_seqs, block_split_kvs, blk_coord
-                )
-                if k_tile_count > 0:
-                    mma_common_params = SimpleNamespace(
-                        blk_coord=blk_coord,
-                        local_split_kv=local_split_kv,
-                        load_q_pipeline=load_q_pipeline,
-                        load_kv_pipeline=load_kv_pipeline,
-                        tmem_ptr=tmem_ptr,
-                        is_leader_cta=is_leader_cta,
-                        L=mCL.shape[1],
-                    )
-                    mma_qk_params = SimpleNamespace(
-                        mma_s_pipeline=mma_s_pipeline,
-                        sQ=sQ,
-                        sKC=sKC,
-                    )
-                    mma_pv_params = SimpleNamespace(
-                        p_mma_pipeline=p_mma_pipeline,
-                        mma_o_pipeline=mma_o_pipeline,
-                        sP=sP,
-                        sVC=sVC,
-                    )
-                    (
-                        tiled_mma_qk,
-                        tiled_mma_pv,
-                        load_q_consumer_state,
-                        load_kv_consumer_state,
-                        mma_s_producer_state,
-                        p_mma_consumer_state,
-                        mma_o_producer_state,
-                    ) = self.mma_role.mma(
-                        mma_common_params,
-                        mma_qk_params,
-                        mma_pv_params,
-                        k_tile_count,
-                        tiled_mma_qk,
-                        tiled_mma_pv,
-                        load_q_consumer_state,
-                        load_kv_consumer_state,
-                        mma_s_producer_state,
-                        p_mma_consumer_state,
-                        mma_o_producer_state,
-                    )
-                tile_sched.advance_to_next_work()
-                work_tile = tile_sched.get_current_work()
-
-            mma_s_pipeline.producer_tail(mma_s_producer_state)
-            mma_o_pipeline.producer_tail(mma_o_producer_state)
-
-            cute.arch.relinquish_tmem_alloc_permit(is_two_cta=self.config.use_2cta_instrs)
-            # Dealloc the tensor memory buffer
-            cute.arch.mbarrier_wait(tmem_dealloc_mbar_ptr, 0)
-
-            cute.arch.dealloc_tmem(
-                tmem_ptr,
-                cute.arch.SM100_TMEM_CAPACITY_COLUMNS,
-                is_two_cta=self.config.use_2cta_instrs,
+            self.mma_role.run(
+                tiled_mma_qk, tiled_mma_pv,
+                sQ, sKC, sP, sVC,
+                load_q_pipeline, load_kv_pipeline,
+                mma_s_pipeline, p_mma_pipeline, mma_o_pipeline,
+                tmem_holding_buf, tmem_dealloc_mbar_ptr,
+                self.tmem_ptr_sync_bar,
+                mCL.shape[1], is_leader_cta,
+                tile_sched_params,
+                split_kv, cache_seqs, block_split_kvs,
             )
 
         # ///////////////////////////////////////////////////////////////////////////////
@@ -613,83 +433,19 @@ class BlackwellMultiLatentAttentionForward:
             warp_idx >= self.schedule.compute_warp_ids[0]
             and warp_idx <= self.schedule.compute_warp_ids[-1]
         ):
-            mma_s_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.mainloop.mma_s_stages
+            self.compute_role.run(
+                tiled_mma_qk, tiled_mma_pv,
+                sP, smem_exchange,
+                mma_s_pipeline, p_mma_pipeline, mma_o_pipeline,
+                tmem_holding_buf, tmem_dealloc_mbar_ptr,
+                self.tmem_ptr_sync_bar,
+                mO, mLSE, mAccO, mAccLSE,
+                mCL.shape[1], cache_seqs,
+                split_kv, block_split_kvs,
+                softmax_scale_log2, output_scale,
+                tidx, cta_rank_in_cluster,
+                tile_sched_params,
             )
-            p_mma_producer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, self.mainloop.p_mma_stages
-            )
-            mma_o_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.mainloop.mma_o_stages
-            )
-            # sync with mma warp before retrieving tmem ptr
-            self.tmem_ptr_sync_bar.wait()
-
-            tmem_ptr = cute.arch.retrieve_tmem_ptr(
-                self.config.acc_dtype,
-                alignment=16,
-                ptr_to_buffer_holding_addr=tmem_holding_buf,
-            )
-
-            tile_sched = create_mla_static_tile_scheduler(
-                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
-            )
-            work_tile = tile_sched.initial_work_tile_info()
-            while work_tile.is_valid_tile:
-                blk_coord = work_tile.tile_idx
-                k_index, k_tile_count, local_split_kv = self.get_k_tile_count(
-                    split_kv, cache_seqs, block_split_kvs, blk_coord
-                )
-                if k_tile_count > 0:
-                    compute_common_params = SimpleNamespace(
-                        blk_coord=blk_coord,
-                        split_kv=split_kv,
-                        local_split_kv=local_split_kv,
-                        smem_exchange=smem_exchange,
-                        mAccO=mAccO,
-                        mO=mO,
-                        K=cache_seqs[blk_coord[2]],
-                        L=mCL.shape[1],
-                        tmem_ptr=tmem_ptr,
-                        tidx=tidx,
-                    )
-                    compute_softmax_params = SimpleNamespace(
-                        tiled_mma_qk=tiled_mma_qk,
-                        sP=sP,
-                        mma_s_pipeline=mma_s_pipeline,
-                        p_mma_pipeline=p_mma_pipeline,
-                        softmax_scale_log2=softmax_scale_log2,
-                    )
-                    compute_rescale_params = SimpleNamespace(
-                        tiled_mma_pv=tiled_mma_pv,
-                        mma_o_pipeline=mma_o_pipeline,
-                    )
-                    compute_epilogue_params = SimpleNamespace(
-                        tiled_mma_pv=tiled_mma_pv,
-                        mma_o_pipeline=mma_o_pipeline,
-                        output_scale=output_scale,
-                        softmax_scale_log2=softmax_scale_log2,
-                        mAccLSE=mAccLSE,
-                        mLSE=mLSE,
-                    )
-                    mma_s_consumer_state, p_mma_producer_state, mma_o_consumer_state = (
-                        self.compute_role.compute(
-                            compute_common_params,
-                            compute_softmax_params,
-                            compute_rescale_params,
-                            compute_epilogue_params,
-                            k_index=k_index,
-                            k_tile_count=k_tile_count,
-                            mma_s_consumer_state=mma_s_consumer_state,
-                            p_mma_producer_state=p_mma_producer_state,
-                            mma_o_consumer_state=mma_o_consumer_state,
-                        )
-                    )
-                tile_sched.advance_to_next_work()
-                work_tile = tile_sched.get_current_work()
-
-            # Arrive for the tensor memory deallocation barrier
-            cute.arch.mbarrier_arrive(tmem_dealloc_mbar_ptr, cta_rank_in_cluster ^ 1)
 
         return
 
@@ -803,67 +559,6 @@ class BlackwellMultiLatentAttentionForward:
         return
 
     @staticmethod
-    def get_split_kv(
-        B: int, K: int, mma_qk_tiler_mn: tuple, max_active_blocks: int
-    ) -> int:
-        """Get the proper split_kv value for the MLA kernel based on parameters.
-
-        :param B: Batch size
-        :type B: int
-        :param K: Sequence length
-        :type K: int
-        :param mma_qk_tiler_mn: MLA tiling parameters
-        :type mma_qk_tiler_mn: tuple
-        :param max_active_blocks: Maximum number of active blocks
-        :type max_active_blocks: int
-        :return: Split_kv value
-        :rtype: int
-        """
-        max_splits = ceil_div(K, mma_qk_tiler_mn[1])
-        blocks_per_batch = max(1, max_active_blocks // B)
-        split_heur = min(max_splits, blocks_per_batch)
-        # {$nv-internal-release begin}
-        # TODO: figure out the error of make_tile with dynamic int_tuple
-        # {$nv-internal-release end}
-        k_waves = ceil_div(max_splits, split_heur)
-        split_wave_aware = ceil_div(max_splits, k_waves)
-        return split_wave_aware
-
-    @cute.jit
-    def get_k_tile_count(
-        self,
-        split_kv: cutlass.Int32,
-        cache_seqs: cute.Tensor,
-        block_split_kvs: cute.Tensor,
-        blk_coord: cute.Coord,
-    ) -> tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32]:
-        """Get the current k_index, k_tile_count, and local split_kv value for the MLA kernel.
-
-        :param split_kv: Split_kv value
-        :type split_kv: cutlass.Int32
-        :param cache_seqs: Cache sequence lengths tensor
-        :type cache_seqs: cute.Tensor
-        :param block_split_kvs: Per-block split_kv values tensor
-        :type block_split_kvs: cute.Tensor
-        :param blk_coord: Block coordinate
-        :type blk_coord: cute.Coord
-        :return: k_index, k_tile_count, split_kv
-        :rtype: tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32]
-        """
-        K = cache_seqs[blk_coord[2]]
-        if cutlass.const_expr(self.config.is_var_split_kv):
-            split_kv = block_split_kvs[blk_coord[2]]
-
-        k_tile_total = cute.ceil_div(K, self.config.mma_qk_tiler[1])
-        # {$nv-internal-release begin}
-        # TODO: figure out the error of make_tile with dynamic int_tuple
-        # {$nv-internal-release end}
-        k_tile_per_cta = cute.ceil_div(k_tile_total, split_kv)
-        k_index = blk_coord[3] * k_tile_per_cta
-        k_tile_count = max(0, min(k_tile_total, k_index + k_tile_per_cta) - k_index)
-        return k_index, k_tile_count, split_kv
-
-    @staticmethod
     def _compute_grid(
         o: cute.Tensor,
         split_kv: cutlass.Int32,
@@ -896,178 +591,3 @@ class BlackwellMultiLatentAttentionForward:
 
         return tile_sched_params, grid
 
-    @staticmethod
-    def get_workspace_size(
-        H: int,
-        D: int,
-        B: int,
-        split_kv: int,
-        acc_dtype: Type[cutlass.Numeric],
-    ) -> int:
-        """Get the extra workspace(device memory) size for the MLA kernel when split_kv is not 1.
-
-        :param H: The height of the output tensor C
-        :type H: int
-        :param D: The depth of the output tensor C
-        :type D: int
-        :param B: The batch size of the output tensor C
-        :type B: int
-        :param split_kv: The split key-value of the output tensor C
-        :type split_kv: int
-        :param acc_dtype: The data type of the output tensor C
-        :type acc_dtype: Type[cutlass.Numeric]
-
-        :return: The workspace size for the MLA kernel
-        :rtype: int
-        """
-        if split_kv == 1:
-            return 0
-        return B * H * split_kv * (D + 1) * acc_dtype.width // 8
-
-    @cute.jit
-    def initialize_workspace(
-        self,
-        H: cutlass.Int32,
-        D: cutlass.Int32,
-        B: cutlass.Int32,
-        split_kv: cutlass.Int32,
-        acc_dtype: Type[cutlass.Numeric],
-        workspace: cute.Tensor,
-    ) -> tuple[cute.Tensor, cute.Tensor]:
-        """Initialize the workspace for the MLA kernel. Construct the intermediate tensors
-        acc_o and acc_lse.
-
-        :param H: The height of the output tensor C
-        :type H: cutlass.Int32
-        :param D: The depth of the output tensor C
-        :type D: cutlass.Int32
-        :param B: The batch size of the output tensor C
-        :type B: cutlass.Int32
-        :param split_kv: The split key-value of the output tensor C
-        :type split_kv: cutlass.Int32
-        :param acc_dtype: The data type of the output tensor C
-        :type acc_dtype: Type[cutlass.Numeric]
-        :param workspace: The workspace tensor
-        :type workspace: cute.Tensor
-
-        :return: The output tensor C and the workspace tensor
-        :rtype: tuple[cute.Tensor, cute.Tensor]
-        """
-        acc_o, acc_lse = None, None
-        if cutlass.const_expr(workspace is not None):
-            align = 128 // self.q_dtype.width
-            acc_o_layout = cute.make_layout(
-                (H, split_kv, D, B),
-                stride=(
-                    cute.assume(split_kv * D, align),
-                    cute.assume(D, align),
-                    1,
-                    cute.assume(H * split_kv * D, align),
-                ),
-            )
-            acc_o_iter = cute.recast_ptr(workspace.iterator, dtype=acc_dtype)
-            acc_o = cute.make_tensor(acc_o_iter, acc_o_layout)
-            acc_lse_layout = cute.make_layout(
-                (H, split_kv, B), stride=(split_kv, 1, H * split_kv)
-            )
-            acc_lse_iter = cute.recast_ptr(
-                workspace.iterator + cute.cosize(acc_o_layout) * acc_dtype.width // 8,
-                dtype=acc_dtype,
-            )
-            acc_lse = cute.make_tensor(acc_lse_iter, acc_lse_layout)
-        return acc_o, acc_lse
-
-    @staticmethod
-    def can_implement(
-        B: int,
-        K: int,
-        H: int,
-        L: int,
-        R: int,
-        in_dtype: Type[cutlass.Numeric],
-        out_dtype: Type[cutlass.Numeric],
-        acc_dtype: Type[cutlass.Numeric],
-        lse_dtype: Type[cutlass.Numeric],
-        mma_qk_tiler_mn: Tuple[int, int],
-        mma_pv_tiler_mn: Tuple[int, int],
-        split_kv: int,
-        is_persistent: bool,
-        is_cpasync: bool,
-        is_var_seq: bool,
-        is_var_split_kv: bool,
-        use_page_table: bool,
-        page_size: int,
-    ) -> bool:
-        """Check if the MLA kernel can be implemented.
-
-        :param H: The height of the output tensor C
-        :type H: int
-        :param K: The width of the output tensor C
-        :type K: int
-        :param L: The length of the output tensor C
-        :type L: int
-        :param R: The row of the output tensor C
-        :type R: int
-        :param B: The batch size of the output tensor C
-        :type B: int
-        :param in_dtype: The data type of the input tensor
-        :type in_dtype: Type[cutlass.Numeric]
-        :param out_dtype: The data type of the output tensor
-        :type out_dtype: Type[cutlass.Numeric]
-        :param acc_dtype: The data type of the accumulator
-        :type acc_dtype: Type[cutlass.Numeric]
-        :param lse_dtype: The data type of the log-sum-exp
-        :type lse_dtype: Type[cutlass.Numeric]
-        :param mma_qk_tiler_mn: The tile shape of the query-key matrix multiplication
-        :type mma_qk_tiler_mn: Tuple[int, int]
-        :param mma_pv_tiler_mn: The tile shape of the probability-value matrix multiplication
-        :type mma_pv_tiler_mn: Tuple[int, int]
-        :param split_kv: The split key-value of the output tensor C
-        :type split_kv: int
-        :param is_persistent: Whether to use persistent kernel optimization
-        :type is_persistent: bool
-        :param is_cpasync: Whether to use cpasync
-        :type is_cpasync: bool
-        :param is_var_seq: Whether to use variable sequence length
-        :type is_var_seq: bool
-        :param is_var_split_kv: Whether to use variable split_kv
-        :type is_var_split_kv: bool
-        :param use_page_table: Whether to use page table
-        :type use_page_table: bool
-        :param page_size: The page size of the page table
-        :type page_size: int
-
-        :return: Whether the MLA kernel can be implemented
-        :rtype: bool
-        """
-        if L != 512 or R != 64:
-            return False
-        if in_dtype not in [cutlass.Float8E4M3FN, cutlass.Float16, cutlass.BFloat16]:
-            return False
-        if out_dtype not in [cutlass.Float16, cutlass.BFloat16]:
-            return False
-        if acc_dtype != cutlass.Float32 or lse_dtype != cutlass.Float32:
-            return False
-        if is_cpasync:
-            if not use_page_table:
-                return False
-            if page_size & (page_size - 1) != 0:
-                return False
-            if page_size > mma_qk_tiler_mn[1]:
-                return False
-        else:
-            if use_page_table and page_size != mma_qk_tiler_mn[1]:
-                return False
-        if mma_qk_tiler_mn[0] != 128 or mma_pv_tiler_mn[0] != 128:
-            return False
-        if mma_pv_tiler_mn[1] * 32 != mma_qk_tiler_mn[1] * R:
-            return False
-        if is_var_split_kv and (not use_page_table or not is_var_seq):
-            return False
-        if is_var_seq and not use_page_table:
-            return False
-        # if H != 128:
-        #     return False
-        if K <= 0:
-            return False
-        return True

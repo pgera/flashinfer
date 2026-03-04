@@ -19,6 +19,8 @@ import cutlass.torch as cutlass_torch
 from cutlass.cute.runtime import from_dlpack
 
 from ..mla_decode import BlackwellMultiLatentAttentionForward
+from ..mla_config import mla_can_implement
+from ..scheduler.mla_persistent import mla_get_split_kv
 
 
 def ceil_div(a: int, b: int) -> int:
@@ -75,7 +77,7 @@ def create_block_split_kvs(
     if is_var_split_kv:
         block_split_kvs_ref = torch.zeros([batch_size], dtype=torch.int32)
         for b in range(batch_size):
-            block_split_kvs_ref[b] = BlackwellMultiLatentAttentionForward.get_split_kv(
+            block_split_kvs_ref[b] = mla_get_split_kv(
                 batch_size,
                 cache_seqs_ref[b].item(),
                 mma_qk_tiler_mn,
@@ -87,7 +89,7 @@ def create_block_split_kvs(
             block_split_kvs_gpu, assumed_align=16
         ).mark_layout_dynamic()
     elif split_kv <= 0:
-        split_kv = BlackwellMultiLatentAttentionForward.get_split_kv(
+        split_kv = mla_get_split_kv(
             batch_size,
             cache_seqs_ref[0].item(),
             mma_qk_tiler_mn,
@@ -96,13 +98,24 @@ def create_block_split_kvs(
     return split_kv, block_split_kvs_ref, block_split_kvs, block_split_kvs_gpu
 
 
+def mla_get_workspace_size(H, D, B, split_kv, acc_dtype):
+    """Get workspace size (bytes) for MLA split-KV intermediate buffers.
+
+    :param H: Number of heads
+    :param D: Latent dimension
+    :param B: Batch size
+    :param split_kv: Split-KV factor
+    :param acc_dtype: Accumulator data type
+    :return: Workspace size in bytes (0 if split_kv == 1)
+    """
+    if split_kv == 1:
+        return 0
+    return B * H * split_kv * (D + 1) * acc_dtype.width // 8
+
+
 def create_workspace(num_heads, latent_dim, batch_size, split_kv, acc_dtype):
-    workspace_size = BlackwellMultiLatentAttentionForward.get_workspace_size(
-        num_heads,
-        latent_dim,
-        batch_size,
-        split_kv,
-        acc_dtype,
+    workspace_size = mla_get_workspace_size(
+        num_heads, latent_dim, batch_size, split_kv, acc_dtype
     )
 
     workspace, workspace_torch = None, None
@@ -359,7 +372,7 @@ class BatchMLAPagedAttentionWrapperCuteDSL:
             device="cuda",
         )
 
-        if not BlackwellMultiLatentAttentionForward.can_implement(
+        if not mla_can_implement(
             batch_size,
             seq_len,
             num_heads,
@@ -468,23 +481,26 @@ class BatchMLAPagedAttentionWrapperCuteDSL:
             num_heads, head_dim_ckv, batch_size, self._split_kv, self._acc_dtype
         )
 
-        mla = BlackwellMultiLatentAttentionForward(
-            head_dim_ckv,
-            head_dim_kpe,
-            num_heads,
-            self._acc_dtype,
-            self._lse_dtype,
-            self._mma_qk_tiler_mn,
-            self._mma_pv_tiler_mn,
-            max_active_clusters,
-            self._is_persistent,
-            self._is_cpasync,
-            self._use_page_table,
-            self._is_var_seq,
-            self._is_var_split_kv,
-            self._use_2cta_instrs,
-            self._cluster_shape_mnk,
+        from ..mla_config import MLAConfig
+
+        mla_config = MLAConfig(
+            latent_dim=head_dim_ckv,
+            rope_dim=head_dim_kpe,
+            num_heads=num_heads,
+            acc_dtype=self._acc_dtype,
+            lse_dtype=self._lse_dtype,
+            mma_qk_tiler_mn=self._mma_qk_tiler_mn,
+            mma_pv_tiler_mn=self._mma_pv_tiler_mn,
+            max_active_clusters=max_active_clusters,
+            is_persistent=self._is_persistent,
+            is_cpasync=self._is_cpasync,
+            use_page_table=self._use_page_table,
+            is_var_seq=self._is_var_seq,
+            is_var_split_kv=self._is_var_split_kv,
+            use_2cta_instrs=self._use_2cta_instrs,
+            cluster_shape_mnk=self._cluster_shape_mnk,
         )
+        mla = BlackwellMultiLatentAttentionForward(mla_config)
 
         torch_stream = torch.cuda.current_stream()
         stream = cuda.CUstream(torch_stream.cuda_stream)

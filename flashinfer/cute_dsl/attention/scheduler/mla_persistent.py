@@ -198,3 +198,48 @@ def create_mla_static_tile_scheduler(
     grid_shape: cute.Shape,
 ) -> MLAStaticTileScheduler:
     return MLAStaticTileScheduler(params, blk_coord[0], blk_coord, grid_shape)
+
+
+def mla_get_k_tile_count(
+    mma_qk_tiler_n,
+    is_var_split_kv,
+    split_kv,
+    cache_seqs,
+    block_split_kvs,
+    blk_coord,
+):
+    """Device-side tile range computation for MLA split-KV.
+
+    Returns (k_index, k_tile_count, local_split_kv) for the current block coordinate.
+    """
+    K = cache_seqs[blk_coord[2]]
+    if cutlass.const_expr(is_var_split_kv):
+        split_kv = block_split_kvs[blk_coord[2]]
+
+    k_tile_total = cute.ceil_div(K, mma_qk_tiler_n)
+    k_tile_per_cta = cute.ceil_div(k_tile_total, split_kv)
+    k_index = blk_coord[3] * k_tile_per_cta
+    k_tile_count = max(0, min(k_tile_total, k_index + k_tile_per_cta) - k_index)
+    return k_index, k_tile_count, split_kv
+
+
+def mla_get_split_kv(
+    B: int, K: int, mma_qk_tiler_mn: tuple, max_active_blocks: int
+) -> int:
+    """Compute the split-KV factor for MLA decode based on problem size and hardware occupancy.
+
+    :param B: Batch size
+    :param K: Sequence length
+    :param mma_qk_tiler_mn: MMA QK tile shape (M, N)
+    :param max_active_blocks: Maximum number of active blocks on the GPU
+    :return: Optimal split-KV factor
+    """
+    def _ceil_div(a, b):
+        return (a + b - 1) // b
+
+    max_splits = _ceil_div(K, mma_qk_tiler_mn[1])
+    blocks_per_batch = max(1, max_active_blocks // B)
+    split_heur = min(max_splits, blocks_per_batch)
+    k_waves = _ceil_div(max_splits, split_heur)
+    split_wave_aware = _ceil_div(max_splits, k_waves)
+    return split_wave_aware

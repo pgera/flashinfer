@@ -144,26 +144,6 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.mainloop = make_prefill_mainloop_spec(config, self.schedule)
         self.tmem = self.mainloop.tmem_layout
 
-        self.softmax_role = SoftmaxRole(
-            config, self.fusion, self.tmem,
-            softmax0_warp_ids=self.schedule.softmax0_warp_ids,
-            softmax1_warp_ids=self.schedule.softmax1_warp_ids,
-            threads_per_warp=self.schedule.threads_per_warp,
-        )
-        self.correction_role = CorrectionRole(
-            config, self.fusion, self.tmem,
-            correction_warp_ids=self.schedule.correction_warp_ids,
-            threads_per_warp=self.schedule.threads_per_warp,
-        )
-        self.epilogue_role = EpilogueRole(config)
-        self.loader_role = LoaderRole(config)
-        self.mma_role = MmaRole(
-            config,
-            tmem_alloc_cols=self.tmem.alloc_cols,
-            tmem_alloc_sync_bar_id=self.schedule.tmem_alloc_sync_bar_id,
-            threads_per_warp=self.schedule.threads_per_warp,
-        )
-
     @cute.jit
     def __call__(
         self,
@@ -269,9 +249,6 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.v_dtype = v.element_type
         self.o_dtype = o.element_type
 
-        # Propagate tensor-type info to roles
-        self.softmax_role.set_dtypes(self.q_dtype, self.o_dtype)
-
         self.tile_sched_params, grid = self._compute_grid(
             cute.shape((s_q, d, ((h_r, h_k), b))),
             self.config.cta_tiler,
@@ -296,6 +273,27 @@ class BlackwellFusedMultiHeadAttentionForward:
         if cutlass.const_expr(self.q_dtype != self.v_dtype):
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.v_dtype}")
         self.mainloop.resolve(self.q_dtype.width)
+
+        self.softmax_role = SoftmaxRole(
+            self.config, self.fusion, self.tmem,
+            softmax0_warp_ids=self.schedule.softmax0_warp_ids,
+            softmax1_warp_ids=self.schedule.softmax1_warp_ids,
+            threads_per_warp=self.schedule.threads_per_warp,
+        )
+        self.correction_role = CorrectionRole(
+            self.config, self.fusion, self.tmem,
+            correction_warp_ids=self.schedule.correction_warp_ids,
+            threads_per_warp=self.schedule.threads_per_warp,
+        )
+        self.epilogue_role = EpilogueRole(self.config)
+        self.loader_role = LoaderRole(self.config)
+        self.mma_role = MmaRole(
+            self.config,
+            tmem_alloc_cols=self.tmem.alloc_cols,
+            tmem_alloc_sync_bar_id=self.schedule.tmem_alloc_sync_bar_id,
+            threads_per_warp=self.schedule.threads_per_warp,
+        )
+        self.softmax_role.set_dtypes(self.q_dtype, self.o_dtype)
 
         lp = build_fmha_launch_params(
             self.mainloop, q, k, v, o,
