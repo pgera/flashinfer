@@ -1160,6 +1160,283 @@ MLA roles have `run()` methods that own their tile scheduler loops, so the kerne
 
 ---
 
+## 11. Call Traces
+
+This section shows the complete call flow through the building blocks for each attention variant, from user-facing API down to individual warp roles.
+
+### FMHA Prefill
+
+```
+User code
+  │
+  ▼
+BatchPrefillCuteDSLWrapper                           [wrappers/batch_prefill.py]
+  │
+  ├── plan(qo_indptr, kv_indptr, num_heads, head_dim, ...)
+  │     │
+  │     ├── Create AttentionConfig(qk_acc_dtype, mma_tiler, mask_type, ...)    [config.py]
+  │     ├── Create AttentionFusion(logits_transform, output_transform, ...)    [config.py]
+  │     ├── fmha = BlackwellFusedMultiHeadAttentionForward(config, fusion)     [prefill.py]
+  │     │     │
+  │     │     └── __init__: store config, fusion, schedule
+  │     │           ├── mainloop = make_prefill_mainloop_spec(config, schedule)  [mainloop_spec.py]
+  │     │           │     ├── topology = make_prefill_topology(schedule)         [pipeline_topology.py]
+  │     │           │     ├── tmem_layout = TmemLayout.from_config(config)       [tmem_layout.py]
+  │     │           │     └── MainloopSpec(config, schedule, topology, tmem)
+  │     │           └── tmem = mainloop.tmem_layout
+  │     │
+  │     ├── qkvo_cute = create_and_pad_tensor(...)         (torch → CuTe tensors)
+  │     ├── compiled_fmha = cute.compile(fmha, q, k, v, o, ...)
+  │     └── store compiled_fmha
+  │
+  └── run(q, k, v)
+        │
+        ├── Copy torch data into pre-allocated CuTe tensors
+        └── compiled_fmha(q_ptr, k_ptr, v_ptr, o_ptr, ...)
+              │
+              ▼
+BlackwellFusedMultiHeadAttentionForward.__call__     [prefill.py]
+  │
+  ├── Build Q/K/V/O CuTe layouts from pointers + problem_size
+  ├── _compute_grid() → tile_sched_params, grid            [prefill.py]
+  │     └── FmhaStaticTileScheduler.get_grid_shape(...)    [scheduler/persistent.py]
+  ├── mainloop.resolve(dtype_width)                        [mainloop_spec.py]
+  │     └── Compute pipeline stage counts from SMEM budget
+  ├── Create roles:
+  │     ├── SoftmaxRole(config, fusion, tmem, ...)         [roles/softmax.py]
+  │     ├── CorrectionRole(config, fusion, tmem, ...)      [roles/correction.py]
+  │     ├── EpilogueRole(config)                           [roles/epilogue.py]
+  │     ├── LoaderRole(config)                             [roles/loader_tma.py]
+  │     └── MmaRole(config, tmem, ...)                     [roles/mma.py]
+  ├── lp = build_fmha_launch_params(mainloop, q, k, v, o, ...)  [collective_builder.py]
+  │     ├── Create QK and PV TiledMma atoms
+  │     ├── Compute SMEM layouts (q, k, v, p, o)
+  │     ├── Create TMA atoms and descriptors
+  │     └── Define SharedStorage struct (SMEM + pipeline barriers)
+  └── kernel(...).launch(grid, block, smem, stream)
+        │
+        ▼
+BlackwellFusedMultiHeadAttentionForward.kernel       [prefill.py]  ◄── GPU device code
+  │
+  ├── Allocate shared memory (SharedStorage)
+  ├── _create_pipelines(storage)                           [prefill.py]
+  │     └── topology.create_pipelines(barrier_ptrs, ...)   [pipeline_topology.py]
+  │           └── Returns dict of (producer, consumer) pipeline pairs:
+  │                 load_q, load_kv, mma_s0, mma_s1,
+  │                 s0_corr, s1_corr, corr_epi, mma_corr, s0_s1_sequence
+  ├── Unpack SMEM tensors: sQ, sK, sV, sO
+  ├── _create_mma_fragments(...)                           [prefill.py]
+  │     └── Create TMEM fragment views: tStS0/1, tOtO0/1, tOrP0/1
+  │
+  ├── Warp dispatch (16 warps):
+  │
+  │   warp 15 (empty):     reg_dealloc
+  │
+  │   warp 13 (load):      LoaderRole.run(...)             [roles/loader_tma.py]
+  │                           ├── Tile scheduler loop (FmhaStaticTileScheduler)
+  │                           ├── TMA load Q, K, V into SMEM
+  │                           └── Signal load_q_producer, load_kv_producer
+  │
+  │   warp 12 (mma):       MmaRole.run(...)                [roles/mma.py]
+  │                           ├── TMEM alloc
+  │                           ├── Tile scheduler loop
+  │                           ├── QK GEMM: tSrQ × tSrK → tStS (TMEM)
+  │                           ├── Signal mma_s0/s1_producer
+  │                           ├── PV GEMM: tOrP × tOrV → tOtO (TMEM)
+  │                           └── Signal mma_corr_producer
+  │
+  │   warps 0-3 (softmax0): SoftmaxRole.run(stage=0, ...)  [roles/softmax.py]
+  │                           ├── Tile scheduler loop
+  │                           ├── TMEM load S0 scores
+  │                           ├── apply_mask(causal/sliding_window)   [fusion/mask.py]
+  │                           ├── exp2_scale(row - max)               [roles/softmax_math.py]
+  │                           ├── 4-way unrolled row_sum (ILP-optimized)
+  │                           ├── Optional: logits_transform          [fusion/logits_transform.py]
+  │                           ├── Optional: M_D_update (sink)         [fusion/softmax_modifier.py]
+  │                           ├── Write P back to TMEM
+  │                           └── Signal s0_corr_producer
+  │
+  │   warps 4-7 (softmax1): SoftmaxRole.run(stage=1, ...)  (same as softmax0, on S1)
+  │
+  │   warps 8-11 (correction): CorrectionRole.run(...)     [roles/correction.py]
+  │                           ├── Tile scheduler loop
+  │                           ├── TMEM load O accumulators
+  │                           ├── Rescale O by exp2(old_max - new_max)
+  │                           ├── Optional: output_transform          [fusion/output_transform.py]
+  │                           ├── Store to SMEM sO
+  │                           └── Signal corr_epi_producer
+  │
+  │   warp 14 (epilogue):  EpilogueRole.run(...)           [roles/epilogue.py]
+  │                           ├── Tile scheduler loop
+  │                           ├── TMA store sO → global memory
+  │                           └── Wait on corr_epi_consumer
+  │
+  └── return
+```
+
+### MLA Decode
+
+```
+User code
+  │
+  ▼
+BatchMLAPagedAttentionWrapperCuteDSL                 [wrappers/batch_mla.py]
+  │
+  ├── plan(qo_indptr, kv_indptr, kv_indices, kv_len_arr, num_heads, ...)
+  │     │
+  │     ├── mla_can_implement(...)                         [mla_config.py]
+  │     ├── create_page_table(batch, seq, ..., kv_indptr, kv_indices)  [wrappers/batch_mla.py]
+  │     ├── create_block_split_kvs(...)                    [wrappers/batch_mla.py]
+  │     │     └── mla_get_split_kv(...)                    [scheduler/mla_persistent.py]
+  │     ├── create_workspace(...)                          [wrappers/batch_mla.py]
+  │     ├── qkvo_cute = torch_to_cute(...)                 (torch → CuTe tensors)
+  │     ├── mla_config = MLAConfig(latent_dim, rope_dim, num_heads, ...)  [mla_config.py]
+  │     ├── mla = BlackwellMultiLatentAttentionForward(mla_config)        [mla_decode.py]
+  │     │     │
+  │     │     └── __init__: store config, schedule
+  │     │           └── mainloop = make_mla_mainloop_spec(config, schedule)  [mainloop_spec.py]
+  │     │                 ├── topology = make_mla_topology(schedule)          [pipeline_topology.py]
+  │     │                 └── MLAMainloopSpec(config, schedule, topology)
+  │     │
+  │     ├── compiled_mla = cute.compile(mla, q_latent, q_rope, ...)
+  │     └── store compiled_mla
+  │
+  └── run(q_nope, q_pe, ckv_cache, kpe_cache)
+        │
+        ├── torch_to_cute for all input tensors
+        └── compiled_mla(q_latent, q_rope, c_latent, c_rope, ...)
+              │
+              ▼
+BlackwellMultiLatentAttentionForward.__call__        [mla_decode.py]
+  │
+  ├── Validate dtypes, strides
+  ├── Build workspace tensors (acc_o, acc_lse) from workspace buffer
+  ├── Create c_latent_transpose view
+  ├── mainloop.resolve(dtype_width)                        [mainloop_spec.py]
+  ├── Create roles:
+  │     ├── MLALoaderRole(config)                          [roles/mla_loader.py]
+  │     ├── MLAMmaRole(config, mainloop)                   [roles/mla_mma.py]
+  │     └── MLAComputeRole(config, mainloop, schedule, exchange_bar)  [roles/mla_compute.py]
+  │           └── Internally creates:
+  │                 ├── MLASoftmaxRole(config)              [roles/mla_softmax.py]
+  │                 ├── MLARescaleRole(config)              [roles/mla_rescale.py]
+  │                 └── MLAEpilogueRole(config)             [roles/mla_epilogue.py]
+  ├── lp = build_mla_launch_params(mainloop, schedule, tensors, ...)  [collective_builder.py]
+  │     ├── Create QK and PV TiledMma atoms
+  │     ├── Compute SMEM layouts (q, kc, vc, p)
+  │     ├── Create TMA atoms (q_latent, q_rope, c_latent, c_rope, c_latent_T)
+  │     └── Define SharedStorage struct (SMEM + pipeline barriers + TMEM buffers)
+  ├── _compute_grid() → tile_sched_params, grid
+  │     └── MLAStaticTileScheduler.get_grid_shape(...)     [scheduler/mla_persistent.py]
+  │
+  ├── kernel(...).launch(grid, block, cluster, smem, stream)   ─── split-KV kernel
+  │     │
+  │     ▼
+  │   kernel(...)                                          [mla_decode.py]  ◄── GPU device code
+  │     │
+  │     ├── Allocate shared memory (SharedStorage)
+  │     ├── Init TMEM dealloc barrier
+  │     ├── _create_pipelines(storage, cta_layout)         [mla_decode.py]
+  │     │     └── topology.create_pipelines_native(...)     [pipeline_topology.py]
+  │     │           └── Returns dict: load_q, load_kv, mma_s, p_mma, mma_o
+  │     ├── Cluster sync
+  │     ├── Unpack SMEM tensors: sQ, sKC, sVC, sP, smem_exchange
+  │     │
+  │     ├── Warp dispatch (6-8 warps):
+  │     │
+  │     │   warp 5 (load_tma):  MLALoaderRole.run(...)     [roles/mla_loader.py]
+  │     │                         ├── _get_k_tile_count()  (@cute.jit, device-side)
+  │     │                         ├── Tile scheduler loop (MLAStaticTileScheduler)
+  │     │                         ├── TMA load Q_latent, Q_rope into SMEM
+  │     │                         ├── Page table lookup → physical page
+  │     │                         ├── TMA load C_latent, C_rope, C_latent_T into SMEM
+  │     │                         └── Signal load_q_producer, load_kv_producer
+  │     │
+  │     │   warp 4 (mma):       MLAMmaRole.run(...)        [roles/mla_mma.py]
+  │     │                         ├── TMEM alloc
+  │     │                         ├── _get_k_tile_count()  (@cute.jit, device-side)
+  │     │                         ├── Tile scheduler loop
+  │     │                         ├── QK GEMM (latent): Q_L × C_L^T → S_latent (TMEM)
+  │     │                         ├── QK GEMM (rope):   Q_R × C_R^T → S_rope (TMEM, accumulate)
+  │     │                         ├── Signal mma_s_producer
+  │     │                         ├── PV GEMM: P × C_L_T → O (TMEM)
+  │     │                         ├── Signal mma_o_producer
+  │     │                         └── TMEM dealloc (after all tiles)
+  │     │
+  │     │   warps 0-3 (compute): MLAComputeRole.run(...)   [roles/mla_compute.py]
+  │     │                         ├── Retrieve TMEM pointers (synced with MMA warp)
+  │     │                         ├── _get_k_tile_count()  (@cute.jit, device-side)
+  │     │                         ├── Tile scheduler loop, dispatching to sub-roles:
+  │     │                         │
+  │     │                         ├── MLASoftmaxRole.compute(...)    [roles/mla_softmax.py]
+  │     │                         │     ├── TMEM load S scores
+  │     │                         │     ├── exp2_scale(row - max)    [roles/softmax_math.py]
+  │     │                         │     ├── packed_row_sum()         [roles/softmax_math.py]
+  │     │                         │     ├── Write P to SMEM
+  │     │                         │     └── Signal p_mma_producer
+  │     │                         │
+  │     │                         ├── MLARescaleRole.run(...)        [roles/mla_rescale.py]
+  │     │                         │     ├── tmem_load_partition()    [roles/tmem_utils.py]
+  │     │                         │     └── Rescale O accumulator
+  │     │                         │
+  │     │                         └── MLAEpilogueRole.run(...)       [roles/mla_epilogue.py]
+  │     │                               ├── tmem_load_partition()    [roles/tmem_utils.py]
+  │     │                               └── Write O, LSE to global memory
+  │     │                                    (or acc_o, acc_lse for split-KV)
+  │     │
+  │     └── return
+  │
+  └── (if split_kv > 1):
+        reduction_kernel(...).launch(...)                  [mla_decode.py]  ◄── GPU device code
+          ├── Load acc_o, acc_lse from all split-KV blocks
+          ├── Find global max LSE across splits
+          ├── Rescale and sum partial O contributions
+          └── Write final O, LSE to global memory
+```
+
+### Shared Building Blocks
+
+Both variants use the same infrastructure, with variant-specific factory functions:
+
+```
+                        FMHA Prefill                    MLA Decode
+                        ────────────                    ──────────
+Config              →   AttentionConfig                 MLAConfig
+                        + AttentionFusion
+
+Warp Schedule       →   WarpSchedule (16 warps)         MLAWarpSchedule (6-8 warps)
+                        PREFILL_SCHEDULE                MLA_DECODE_SCHEDULE
+
+MainloopSpec        →   MainloopSpec                    MLAMainloopSpec
+  factory           →   make_prefill_mainloop_spec()    make_mla_mainloop_spec()
+
+Pipeline Topology   →   make_prefill_topology()         make_mla_topology()
+  (shared types)        PipelineEdge, PipelineType      PipelineEdge, PipelineType
+  pipelines: 10         load_q, load_kv, mma_s0/s1,    load_q, load_kv, mma_s,
+                        s0_corr, s1_corr, corr_epi,     p_mma, mma_o
+                        mma_corr, s0_s1_sequence
+
+CollectiveBuilder   →   build_fmha_launch_params()      build_mla_launch_params()
+  (shared file)         MMA atoms, SMEM, TMA, Storage   MMA atoms, SMEM, TMA, Storage
+
+Tile Scheduler      →   FmhaStaticTileScheduler         MLAStaticTileScheduler
+                                                        + mla_get_split_kv()
+                                                        + mla_get_k_tile_count()
+
+Shared Math         →   exp2_scale() ◄────────────────► exp2_scale()
+  (softmax_math.py)     (4-way unrolled row_sum          packed_row_sum()
+                         kept in SoftmaxRole for ILP)
+
+Shared TMEM         →   (not used)                      tmem_load_partition()
+  (tmem_utils.py)                                       (MLARescaleRole, MLAEpilogueRole)
+
+Masking             →   apply_mask(), MaskType           (boundary masking inline)
+  (fusion/mask.py)      get_trip_count()
+                        get_masked/unmasked_trip_count()
+```
+
+---
+
 ## Appendix: File Reference
 
 ### FlashInfer PR #1549
